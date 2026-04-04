@@ -134,6 +134,12 @@ impl App {
                 self.md_cache = CommonMarkCache::default();
                 self.settings.last_file = Some(path.to_string_lossy().into_owned());
                 self.status = path.to_string_lossy().into_owned();
+                // Update window title: "filename.md - tori markdown viewer"
+                if let Some(name) = path.file_name() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                        format!("{} - tori markdown viewer", name.to_string_lossy()),
+                    ));
+                }
                 self.current_file = Some(path);
             }
             Err(e) => {
