@@ -10,7 +10,7 @@ eframe    = { version = "0.28", default-features = false, features = [
     "persistence",
 ] }
 egui      = "0.28"
-egui_commonmark = { version = "0.16", features = ["better_syntax_highlighting"] }
+egui_commonmark = { version = "0.17", features = ["better_syntax_highlighting"] }
 notify    = "6"
 serde     = { version = "1", features = ["derive"] }
 rfd       = { version = "0.14", features = ["xdg-portal"] }
