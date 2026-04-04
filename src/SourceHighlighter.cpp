@@ -38,7 +38,7 @@ SourceHighlighter::SourceHighlighter(QTextDocument *parent)
     {
         Rule r;
         r.pattern = QRegularExpression(R"(`[^`]+`)");
-        r.format.setFontFamily("Monospace");
+        r.format.setFontFamilies({"Monospace"});
         r.format.setForeground(dark ? QColor("#d4afff") : QColor("#6541b8"));
         r.format.setBackground(dark ? QColor("#1e1530") : QColor("#ede9ff"));
         m_rules.append(r);
@@ -90,7 +90,7 @@ SourceHighlighter::SourceHighlighter(QTextDocument *parent)
     // ---- Fenced code block (``` or ~~~) ----
     m_codeFenceStart = QRegularExpression(R"(^(`{3,}|~{3,}))");
     m_codeFenceEnd   = QRegularExpression(R"(^(`{3,}|~{3,})\s*$)");
-    m_codeBlockFormat.setFontFamily("Monospace");
+    m_codeBlockFormat.setFontFamilies({"Monospace"});
     m_codeBlockFormat.setForeground(dark ? QColor("#e2d9f3") : QColor("#24292e"));
     m_codeBlockFormat.setBackground(dark ? QColor("#130f1f") : QColor("#f6f8fa"));
 }

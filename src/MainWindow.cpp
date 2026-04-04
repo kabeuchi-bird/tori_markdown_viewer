@@ -108,7 +108,7 @@ void MainWindow::setupMenuBar() {
     QAction *openAct = fileMenu->addAction(tr("&Open..."), this, &MainWindow::onOpenFile);
     openAct->setShortcut(QKeySequence::Open);
     fileMenu->addSeparator();
-    fileMenu->addAction(tr("&Quit"), qApp, &QApplication::quit, QKeySequence::Quit);
+    fileMenu->addAction(tr("&Quit"), QKeySequence::Quit, qApp, &QApplication::quit);
 
     QMenu *viewMenu = menuBar()->addMenu(tr("&View"));
     m_normalAction    = viewMenu->addAction(tr("Normal"),    this, &MainWindow::onModeNormal);

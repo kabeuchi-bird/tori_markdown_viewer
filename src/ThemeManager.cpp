@@ -8,8 +8,11 @@
 ThemeManager::ThemeManager(QObject *parent)
     : QObject(parent)
 {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+    // colorSchemeChanged and Qt::ColorScheme were added in Qt 6.5
     connect(QApplication::styleHints(), &QStyleHints::colorSchemeChanged,
             this, &ThemeManager::onOsSchemeChanged);
+#endif
 }
 
 QString ThemeManager::getCss(ViewMode mode, bool dark) const {
@@ -28,11 +31,13 @@ QString ThemeManager::getCss(ViewMode mode, bool dark) const {
 }
 
 bool ThemeManager::detectOsDark() const {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+    // Qt 6.5+ provides a reliable colorScheme() query
     const auto scheme = QApplication::styleHints()->colorScheme();
     if (scheme == Qt::ColorScheme::Dark)  return true;
     if (scheme == Qt::ColorScheme::Light) return false;
-
-    // Fallback: check palette luminance
+#endif
+    // Fallback for Qt < 6.5: check palette window luminance
     const QColor bg = QApplication::palette().color(QPalette::Window);
     return bg.lightness() < 128;
 }
