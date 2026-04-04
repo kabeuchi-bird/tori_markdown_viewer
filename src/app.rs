@@ -361,8 +361,9 @@ impl App {
                             if self.settings.word_wrap {
                                 ui.set_max_width(ui.available_width().min(840.0));
                             }
+                            let decorated = decorate_markdown(&self.markdown);
                             CommonMarkViewer::new("md_decorated")
-                                .show(ui, &mut self.md_cache, &self.markdown);
+                                .show(ui, &mut self.md_cache, &decorated);
                         });
                     });
             }
@@ -488,6 +489,120 @@ fn enumerate_system_fonts() -> Vec<String> {
     families.sort_unstable();
     families.dedup();
     families
+}
+
+// ------------------------------------------------------------------ decorated mode
+
+const H1_DECO: &str   = "✼••┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈••✼";
+const H2_DECO: &str   = "˖✻*˸ꕤ*˸*⋆。";
+const H3_DECO: &str   = "✦";
+const H4_DECO: &str   = "❧";
+const H5_DECO: &str   = "✿";
+
+/// Pre-process Markdown text for Decorated mode by inserting ornamental
+/// decorations around headings. Code fences are left untouched.
+fn decorate_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 512);
+    let mut in_code_block = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+
+        // Toggle code-fence state; pass the fence line through unchanged.
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code_block = !in_code_block;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        if in_code_block {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        // Count leading '#' to find ATX heading level.
+        let level = trimmed.chars().take_while(|&c| c == '#').count();
+
+        if level > 0 && level <= 6 {
+            let after = &trimmed[level..];
+            // CommonMark requires either a space or end-of-line after the hashes.
+            let title = if after.starts_with(' ') {
+                // Strip trailing closing hashes (e.g., `## foo ##`)
+                after[1..].trim_end_matches(|c: char| c == '#' || c == ' ')
+            } else if after.is_empty() {
+                ""
+            } else {
+                // Not a valid ATX heading (e.g., `#nospace`); pass through.
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            };
+
+            let hashes = &trimmed[..level];
+            match level {
+                1 => {
+                    out.push('\n');
+                    out.push_str(H1_DECO);
+                    out.push_str("\n\n");
+                    out.push_str(hashes);
+                    out.push(' ');
+                    out.push_str(title);
+                    out.push_str("\n\n");
+                    out.push_str(H1_DECO);
+                    out.push_str("\n\n");
+                }
+                2 => {
+                    out.push_str(hashes);
+                    out.push(' ');
+                    out.push_str(H2_DECO);
+                    out.push(' ');
+                    out.push_str(title);
+                    out.push(' ');
+                    out.push_str(H2_DECO);
+                    out.push('\n');
+                }
+                3 => {
+                    out.push_str(hashes);
+                    out.push(' ');
+                    out.push_str(H3_DECO);
+                    out.push(' ');
+                    out.push_str(title);
+                    out.push(' ');
+                    out.push_str(H3_DECO);
+                    out.push('\n');
+                }
+                4 => {
+                    out.push_str(hashes);
+                    out.push(' ');
+                    out.push_str(H4_DECO);
+                    out.push(' ');
+                    out.push_str(title);
+                    out.push(' ');
+                    out.push_str(H4_DECO);
+                    out.push('\n');
+                }
+                5 | 6 => {
+                    out.push_str(hashes);
+                    out.push(' ');
+                    out.push_str(H5_DECO);
+                    out.push(' ');
+                    out.push_str(title);
+                    out.push(' ');
+                    out.push_str(H5_DECO);
+                    out.push('\n');
+                }
+                _ => unreachable!(),
+            }
+            continue;
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    out
 }
 
 /// Load raw font bytes for the first face matching the given family name.
