@@ -53,4 +53,3 @@ jobs:
           files: |
             target/release/tori_markdown_viewer
             README.md
-          generate_release_notes: true
