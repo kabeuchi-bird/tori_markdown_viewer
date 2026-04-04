@@ -7,8 +7,11 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets WebEngineWidgets)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(MD4C REQUIRED md4c-html)
+
+# Locate md4c without relying on pkg-config (md4c-html.pc absent on some distros)
+find_library(MD4C_HTML_LIBRARY NAMES md4c-html REQUIRED)
+find_library(MD4C_LIBRARY     NAMES md4c      REQUIRED)
+find_path(MD4C_INCLUDE_DIR    NAMES md4c-html.h REQUIRED)
 
 qt_add_executable(tori_markdown_viewer
     src/main.cpp
@@ -33,13 +36,14 @@ target_link_libraries(tori_markdown_viewer
     PRIVATE
         Qt6::Widgets
         Qt6::WebEngineWidgets
-        ${MD4C_LIBRARIES}
+        ${MD4C_HTML_LIBRARY}
+        ${MD4C_LIBRARY}
 )
 
 target_include_directories(tori_markdown_viewer
     PRIVATE
         src
-        ${MD4C_INCLUDE_DIRS}
+        ${MD4C_INCLUDE_DIR}
 )
 
 install(TARGETS tori_markdown_viewer
