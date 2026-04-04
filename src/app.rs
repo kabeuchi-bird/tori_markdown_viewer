@@ -27,6 +27,16 @@ pub struct App {
     status: String,
     /// Set to true when Open button is clicked; dialog shown after panel render.
     open_dialog: bool,
+
+    // Font selection
+    /// All system font family names, sorted alphabetically.
+    font_families: Vec<String>,
+    /// Search string for the font ComboBox popup.
+    font_search: String,
+    /// Which font was last applied to egui so we don't call set_fonts every frame.
+    last_applied_font: Option<String>,
+    /// Raw font data for the currently applied font (kept alive for egui).
+    loaded_font_data: Option<Vec<u8>>,
 }
 
 impl App {
@@ -40,6 +50,9 @@ impl App {
         // (on first file open) so we can capture the egui Context.
         let (_tx_placeholder, rx) = mpsc::sync_channel::<()>(0);
 
+        // Enumerate system fonts once at startup.
+        let font_families = enumerate_system_fonts();
+
         let mut app = Self {
             markdown: String::new(),
             source_text: String::new(),
@@ -50,10 +63,17 @@ impl App {
             md_cache: CommonMarkCache::default(),
             status: "No file open — drop a Markdown file here or click Open".into(),
             open_dialog: false,
+            font_families,
+            font_search: String::new(),
+            last_applied_font: None,
+            loaded_font_data: None,
         };
 
         // Apply the saved color scheme before the first frame.
         app.apply_scheme(&cc.egui_ctx);
+
+        // Apply the saved (or default) font before the first frame.
+        app.apply_font(&cc.egui_ctx);
 
         // Re-open last file.
         if let Some(path) = settings.last_file.as_deref().map(PathBuf::from) {
@@ -139,12 +159,59 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------------ font
+
+    /// Load the font matching `settings.font_family` and register it with egui.
+    /// When `font_family` is None the egui built-in fonts are used (system default fallback).
+    fn apply_font(&mut self, ctx: &egui::Context) {
+        let desired = self.settings.font_family.clone();
+
+        if desired == self.last_applied_font {
+            return; // Nothing changed.
+        }
+
+        match &desired {
+            None => {
+                // Reset to egui's built-in fonts.
+                ctx.set_fonts(egui::FontDefinitions::default());
+                self.loaded_font_data = None;
+            }
+            Some(family_name) => {
+                if let Some(data) = load_font_data(family_name) {
+                    let mut fonts = egui::FontDefinitions::default();
+                    let key = "user_font".to_owned();
+                    fonts.font_data.insert(
+                        key.clone(),
+                        egui::FontData::from_owned(data.clone()).into(),
+                    );
+                    // Prepend our font so it takes priority over the built-ins.
+                    fonts
+                        .families
+                        .entry(egui::FontFamily::Proportional)
+                        .or_default()
+                        .insert(0, key.clone());
+                    fonts
+                        .families
+                        .entry(egui::FontFamily::Monospace)
+                        .or_default()
+                        .insert(0, key.clone());
+                    ctx.set_fonts(fonts);
+                    self.loaded_font_data = Some(data);
+                }
+                // If load fails, silently keep the current font.
+            }
+        }
+
+        self.last_applied_font = desired;
+    }
+
     // ------------------------------------------------------------------ UI helpers
 
-    /// Draw the toolbar. Returns `(open_requested, scheme_changed)`.
-    fn toolbar_ui(&mut self, ui: &mut egui::Ui) -> (bool, bool) {
+    /// Draw the toolbar. Returns `(open_requested, scheme_changed, font_changed)`.
+    fn toolbar_ui(&mut self, ui: &mut egui::Ui) -> (bool, bool, bool) {
         let mut open_requested = false;
         let mut scheme_changed = false;
+        let mut font_changed = false;
 
         ui.horizontal(|ui| {
             if ui.button("Open").on_hover_text("Open a Markdown file (Ctrl+O)").clicked() {
@@ -171,6 +238,51 @@ impl App {
                     .suffix("pt"),
             );
 
+            ui.separator();
+
+            // ---- Font selector ----
+            ui.label("Font:");
+            let current_label = self
+                .settings
+                .font_family
+                .clone()
+                .unwrap_or_else(|| "System default".to_owned());
+
+            egui::ComboBox::from_id_source("font_selector")
+                .selected_text(&current_label)
+                .width(160.0)
+                .show_ui(ui, |ui: &mut egui::Ui| {
+                    // Search box at the top of the dropdown.
+                    ui.text_edit_singleline(&mut self.font_search);
+
+                    let search_lower = self.font_search.to_lowercase();
+
+                    // "System default" option.
+                    let selected_default = self.settings.font_family.is_none();
+                    if ui
+                        .selectable_label(selected_default, "System default")
+                        .clicked()
+                        && !selected_default
+                    {
+                        self.settings.font_family = None;
+                        font_changed = true;
+                    }
+
+                    // System font list, filtered by search.
+                    for name in &self.font_families {
+                        if !search_lower.is_empty()
+                            && !name.to_lowercase().contains(&search_lower)
+                        {
+                            continue;
+                        }
+                        let selected = self.settings.font_family.as_deref() == Some(name.as_str());
+                        if ui.selectable_label(selected, name).clicked() && !selected {
+                            self.settings.font_family = Some(name.clone());
+                            font_changed = true;
+                        }
+                    }
+                });
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let label = match self.settings.color_scheme {
                     ColorScheme::Auto  => "Auto",
@@ -188,7 +300,7 @@ impl App {
             });
         });
 
-        (open_requested, scheme_changed)
+        (open_requested, scheme_changed, font_changed)
     }
 
     /// Draw the main content area.
@@ -284,13 +396,16 @@ impl eframe::App for App {
         });
 
         // ---- Toolbar ----
-        let (open_requested, scheme_changed) =
+        let (open_requested, scheme_changed, font_changed) =
             egui::TopBottomPanel::top("toolbar")
                 .show(ctx, |ui| self.toolbar_ui(ui))
                 .inner;
 
         if scheme_changed {
             self.apply_scheme(ctx);
+        }
+        if font_changed {
+            self.apply_font(ctx);
         }
 
         // ---- Status bar ----
@@ -331,4 +446,38 @@ impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "settings", &self.settings);
     }
+}
+
+// ------------------------------------------------------------------ font helpers
+
+/// Return a sorted list of all system font family names.
+fn enumerate_system_fonts() -> Vec<String> {
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+
+    let mut families: Vec<String> = db
+        .faces()
+        .filter_map(|f| f.families.first().map(|(name, _)| name.clone()))
+        .collect();
+
+    families.sort_unstable();
+    families.dedup();
+    families
+}
+
+/// Load raw font bytes for the first face matching the given family name.
+fn load_font_data(family_name: &str) -> Option<Vec<u8>> {
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+
+    // Find a face whose primary family matches.
+    let face_id = db.faces().find(|f| {
+        f.families
+            .first()
+            .map_or(false, |(n, _)| n.eq_ignore_ascii_case(family_name))
+    })?
+    .id;
+
+    // fontdb can give us the raw bytes directly.
+    db.with_face_data(face_id, |data, _index| data.to_vec())
 }

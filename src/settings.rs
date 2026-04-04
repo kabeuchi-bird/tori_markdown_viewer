@@ -33,6 +33,10 @@ pub struct Settings {
 
     #[serde(default)]
     pub last_file: Option<String>,
+
+    /// User-selected font family name. None = use system default.
+    #[serde(default)]
+    pub font_family: Option<String>,
 }
 
 fn default_true() -> bool { true }
@@ -46,6 +50,7 @@ impl Default for Settings {
             font_size: 14.0,
             color_scheme: ColorScheme::default(),
             last_file: None,
+            font_family: None,
         }
     }
 }

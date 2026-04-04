@@ -6,15 +6,17 @@ Linux（KDE Plasma）向けのMarkdownビューアです。
 
 - **3種の表示モード切り替え**
   - **Normal** — GitHub風のシンプルなレンダリング
-  - **Decorated** — グラデーション・シャドウを使った装飾マシマシレンダリング
-  - **Source** — Markdownソーステキスト（シンタックスハイライト付き）
+  - **Decorated** — 背景パネルと余白を加えた読みやすいレンダリング
+  - **Source** — Markdownソーステキスト（読み取り専用）
 - **折り返し切り替え** — ウィンドウ幅で折り返す／折り返さない（横スクロール）
-- **フォント・サイズ選択** — ツールバーから自由に変更可能
+- **フォントサイズ変更** — ツールバーのドラッグ値で 8〜72pt を自由に変更
+- **フォント選択** — システムにインストールされた全フォントを一覧から選択可能（検索フィルタ付き）。「System default」を選ぶとegui組み込みフォントを使用
 - **ライト／ダークモード**
-  - デフォルトはOS（KDE Plasma）のカラースキームに自動追従
-  - ツールバーのボタンでAuto / Light / Darkに切り替え可能
+  - デフォルトはOSのカラースキームに自動追従
+  - ツールバーのボタンで Auto / Light / Dark に切り替え可能
 - **ファイル変更検知** — 編集中のファイルをリアルタイム自動リロード
 - **ドラッグ＆ドロップ** でファイルを開く
+- **コマンドライン引数** でファイルを指定して起動可能
 - **設定の永続化** — フォント・モード・ウィンドウサイズ等を次回起動時に復元
 
 ## スクリーンショット
@@ -46,15 +48,13 @@ AppImageはシステムへのインストール不要で、単体のファイル
 
 #### 必要なもの
 
-- CMake 3.16 以上
-- C++17 対応コンパイラ（GCC 10+ / Clang 12+）
-- Qt6 (Widgets, WebEngineWidgets)
-- [md4c](https://github.com/mity/md4c) ライブラリ
-
-#### インストール（Debian/Ubuntu系）
+- [Rust](https://rustup.rs/) 1.75 以上（`cargo` 付属）
+- Linux の場合：以下のシステムライブラリ
 
 ```bash
-sudo apt install cmake ninja-build qt6-base-dev qt6-webengine-dev libmd4c-dev
+sudo apt install \
+  libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+  libxkbcommon-dev libdbus-1-dev libgtk-3-dev pkg-config
 ```
 
 #### ビルド
@@ -62,14 +62,13 @@ sudo apt install cmake ninja-build qt6-base-dev qt6-webengine-dev libmd4c-dev
 ```bash
 git clone https://github.com/kabeuchi-bird/tori_markdown_viewer.git
 cd tori_markdown_viewer
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
+cargo build --release
 ```
 
 #### 起動
 
 ```bash
-./build/tori_markdown_viewer [ファイル.md]
+./target/release/tori_markdown_viewer [ファイル.md]
 ```
 
 ## 使い方
@@ -78,20 +77,22 @@ cmake --build build -j$(nproc)
 |------|------|
 | ファイルを開く | ツールバーの「Open」ボタン、またはドラッグ＆ドロップ |
 | 表示モード切り替え | ツールバーの `Normal` / `Decorated` / `Source` ボタン |
-| 折り返し切り替え | ツールバーの `Wrap` ボタン |
-| フォント変更 | ツールバーのフォントコンボボックス・サイズスピンボックス |
-| カラースキーム | ツールバーの `Auto` / `Light` / `Dark` ボタン（クリックで切り替え） |
+| 折り返し切り替え | ツールバーの `Wrap` チェックボックス |
+| フォントサイズ変更 | ツールバーの `Size` ドラッグ値 |
+| フォント変更 | ツールバーの `Font` コンボボックス（検索フィルタ付き） |
+| カラースキーム | ツールバー右端の `Auto` / `Light` / `Dark` ボタン（クリックで切り替え） |
 
 ## 技術仕様
 
 | 項目 | 詳細 |
 |------|------|
-| 言語 | C++17 |
-| GUIフレームワーク | Qt6 (Widgets + WebEngineWidgets) |
-| Markdownパーサ | [md4c](https://github.com/mity/md4c)（CommonMark準拠） |
-| HTMLレンダリング | QWebEngineView |
-| ソースビュー | QPlainTextEdit + カスタム QSyntaxHighlighter |
-| 設定保存先 | `~/.config/kabeuchi-bird/tori_markdown_viewer.ini` |
+| 言語 | Rust 2021 edition |
+| GUIフレームワーク | [eframe](https://github.com/emilk/egui/tree/master/crates/eframe) / [egui](https://github.com/emilk/egui) 0.28 |
+| Markdownレンダリング | [egui_commonmark](https://github.com/lampsitter/egui_commonmark) 0.17（CommonMark準拠） |
+| ファイル監視 | [notify](https://github.com/notify-rs/notify) 6 |
+| フォント列挙 | [fontdb](https://github.com/RazrFalcon/fontdb) 0.22 |
+| ファイルダイアログ | [rfd](https://github.com/PolyMeilex/rfd) 0.14（xdg-portal対応） |
+| 設定保存先 | `~/.local/share/tori_markdown_viewer/` |
 
 ## ライセンス
 
