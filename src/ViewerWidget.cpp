@@ -29,6 +29,11 @@ ViewerWidget::ViewerWidget(QWidget *parent)
     m_highlighter = new SourceHighlighter(m_sourceEdit->document());
 }
 
+void ViewerWidget::setModeAndCss(ViewMode mode, const QString &css) {
+    m_currentCss = css;  // update CSS before setMode so it renders exactly once with correct CSS
+    setMode(mode);
+}
+
 void ViewerWidget::setMode(ViewMode mode) {
     m_mode = mode;
     if (mode == ViewMode::Source) {

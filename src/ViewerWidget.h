@@ -19,6 +19,9 @@ public:
     void setMode(ViewMode mode);
     ViewMode mode() const { return m_mode; }
 
+    // Switch mode and update CSS in a single render pass (avoids double setHtml call).
+    void setModeAndCss(ViewMode mode, const QString &css);
+
     void setWrap(bool wrap);
     bool wrap() const { return m_wrap; }
 

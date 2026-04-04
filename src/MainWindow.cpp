@@ -57,11 +57,18 @@ MainWindow::MainWindow(QWidget *parent)
     // Restore wrap action state
     m_wrapAction->setChecked(m_settings.wordWrap());
 
-    // Restore font combo / size spinner
+    // Restore font combo / size spinner.
+    // Block signals to suppress spurious setFont callbacks during init
+    // (m_viewer->setFont was already called directly above).
+    m_fontCombo->blockSignals(true);
     if (!m_settings.fontFamily().isEmpty()) {
         m_fontCombo->setCurrentFont(QFont(m_settings.fontFamily()));
     }
+    m_fontCombo->blockSignals(false);
+
+    m_sizeSpinner->blockSignals(true);
     m_sizeSpinner->setValue(m_settings.fontSize());
+    m_sizeSpinner->blockSignals(false);
 
     // Update scheme button label
     switch (m_schemeOverride) {
@@ -228,15 +235,16 @@ void MainWindow::onOpenFile() {
 }
 
 void MainWindow::onModeNormal() {
-    m_viewer->setMode(ViewMode::Normal);
     m_settings.setViewMode(ViewMode::Normal);
-    applyCurrentTheme();
+    // setModeAndCss updates m_currentCss before the render so setHtml is called exactly once.
+    m_viewer->setModeAndCss(ViewMode::Normal,
+                            m_themeManager->getCss(ViewMode::Normal, isDark()));
 }
 
 void MainWindow::onModeDecorated() {
-    m_viewer->setMode(ViewMode::Decorated);
     m_settings.setViewMode(ViewMode::Decorated);
-    applyCurrentTheme();
+    m_viewer->setModeAndCss(ViewMode::Decorated,
+                            m_themeManager->getCss(ViewMode::Decorated, isDark()));
 }
 
 void MainWindow::onModeSource() {
