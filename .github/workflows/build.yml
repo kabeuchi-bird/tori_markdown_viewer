@@ -24,6 +24,7 @@ jobs:
             qt6-declarative-dev \
             qt6-webengine-dev \
             libmd4c-dev \
+            libxkbcommon-dev \
             libgl-dev \
             imagemagick
 

@@ -8,10 +8,12 @@ set(CMAKE_AUTORCC ON)
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets WebEngineWidgets)
 
-# Locate md4c without relying on pkg-config (md4c-html.pc absent on some distros)
-find_library(MD4C_HTML_LIBRARY NAMES md4c-html REQUIRED)
-find_library(MD4C_LIBRARY     NAMES md4c      REQUIRED)
-find_path(MD4C_INCLUDE_DIR    NAMES md4c-html.h REQUIRED)
+# Locate md4c without relying on pkg-config (md4c-html.pc absent on some distros).
+# On some distros (e.g. Ubuntu 24.04) the HTML renderer is bundled into libmd4c,
+# so fall back to 'md4c' when 'md4c-html' is not found as a separate library.
+find_library(MD4C_HTML_LIBRARY NAMES md4c-html md4c REQUIRED)
+find_library(MD4C_CORE_LIBRARY NAMES md4c            REQUIRED)
+find_path(MD4C_INCLUDE_DIR     NAMES md4c-html.h     REQUIRED)
 
 qt_add_executable(tori_markdown_viewer
     src/main.cpp
@@ -37,7 +39,7 @@ target_link_libraries(tori_markdown_viewer
         Qt6::Widgets
         Qt6::WebEngineWidgets
         ${MD4C_HTML_LIBRARY}
-        ${MD4C_LIBRARY}
+        ${MD4C_CORE_LIBRARY}
 )
 
 target_include_directories(tori_markdown_viewer
