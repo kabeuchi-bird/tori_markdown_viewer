@@ -21,16 +21,12 @@ QString MarkdownRenderer::render(const QString &markdown,
     QByteArray htmlFragment;
     htmlFragment.reserve(mdUtf8.size() * 2);
 
-    const unsigned int flags =
-        MD_HTML_FLAG_DEBUG * 0 |
-        0;  // default flags
-
     md_html(mdUtf8.constData(),
             static_cast<MD_SIZE>(mdUtf8.size()),
             md4c_process_output,
             &htmlFragment,
-            MD_DIALECT_COMMONMARK,
-            flags);
+            MD_DIALECT_COMMONMARK,  // parser flags  (0 = strict CommonMark)
+            0);                     // renderer flags (0 = default HTML)
 
     // Build font CSS
     QString fontCss;
@@ -44,8 +40,9 @@ QString MarkdownRenderer::render(const QString &markdown,
     ).arg(fontFamilyEscaped).arg(fontSize);
 
     if (!wrap) {
-        fontCss += "body { white-space: pre; overflow-x: auto; }\n"
-                   "p, li, blockquote { white-space: nowrap; }\n";
+        // Prevent line wrapping; restore pre/code to their natural whitespace.
+        fontCss += "body { overflow-x: auto; white-space: nowrap; }\n"
+                   "pre, code { white-space: pre; }\n";
     }
 
     // Assemble full HTML document

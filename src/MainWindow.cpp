@@ -22,6 +22,8 @@
 #include <QTimer>
 #include <QApplication>
 #include <QPalette>
+#include <QFileInfo>
+#include <QDir>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)

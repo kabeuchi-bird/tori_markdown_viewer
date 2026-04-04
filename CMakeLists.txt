@@ -18,7 +18,6 @@ qt_add_executable(tori_markdown_viewer
     src/ThemeManager.cpp
     src/AppSettings.cpp
     src/SourceHighlighter.cpp
-    resources.qrc
 )
 
 qt_add_resources(tori_markdown_viewer "themes"
