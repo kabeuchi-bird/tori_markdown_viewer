@@ -24,7 +24,6 @@ jobs:
             qt6-base-dev \
             qt6-declarative-dev \
             qt6-webengine-dev \
-            qt6-webchannel-dev \
             libmd4c-dev \
             libgl-dev \
             libfuse2 \
