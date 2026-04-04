@@ -1,0 +1,334 @@
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, SyncSender};
+
+use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
+use notify::{EventKind, RecursiveMode, Watcher};
+
+use crate::settings::{ColorScheme, Settings, ViewMode};
+
+pub struct App {
+    // Content
+    markdown: String,
+    /// Separate clone used by the read-only TextEdit in Source mode.
+    source_text: String,
+    current_file: Option<PathBuf>,
+
+    // Settings (persisted via eframe::Storage)
+    settings: Settings,
+
+    // File-watcher: created once in new(), path updated in open_file()
+    watcher: Option<notify::RecommendedWatcher>,
+    reload_rx: Receiver<()>,
+
+    // Markdown rendering cache (reset when content changes)
+    md_cache: CommonMarkCache,
+
+    // Transient UI
+    status: String,
+    /// Set to true when Open button is clicked; dialog shown after panel render.
+    open_dialog: bool,
+}
+
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let settings: Settings = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, "settings"))
+            .unwrap_or_default();
+
+        // Build the file-watcher channel. The watcher itself is created lazily
+        // (on first file open) so we can capture the egui Context.
+        let (_tx_placeholder, rx) = mpsc::sync_channel::<()>(0);
+
+        let mut app = Self {
+            markdown: String::new(),
+            source_text: String::new(),
+            current_file: None,
+            settings: settings.clone(),
+            watcher: None,
+            reload_rx: rx,
+            md_cache: CommonMarkCache::default(),
+            status: "No file open — drop a Markdown file here or click Open".into(),
+            open_dialog: false,
+        };
+
+        // Apply the saved color scheme before the first frame.
+        app.apply_scheme(&cc.egui_ctx);
+
+        // Re-open last file.
+        if let Some(path) = settings.last_file.as_deref().map(PathBuf::from) {
+            app.open_file_inner(path, &cc.egui_ctx);
+        }
+
+        app
+    }
+
+    // ------------------------------------------------------------------ file I/O
+
+    /// Open a file, update the watcher, and refresh the displayed content.
+    pub fn open_file(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.open_file_inner(path, ctx);
+    }
+
+    fn open_file_inner(&mut self, path: PathBuf, ctx: &egui::Context) {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                // Ensure the watcher exists; create it on the first open.
+                if self.watcher.is_none() {
+                    let (tx, rx): (SyncSender<()>, Receiver<()>) = mpsc::sync_channel(8);
+                    let ctx2 = ctx.clone();
+                    match notify::recommended_watcher(
+                        move |res: notify::Result<notify::Event>| {
+                            if let Ok(ev) = res {
+                                if matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                                    let _ = tx.try_send(());
+                                    ctx2.request_repaint();
+                                }
+                            }
+                        },
+                    ) {
+                        Ok(w) => {
+                            self.reload_rx = rx;
+                            self.watcher = Some(w);
+                        }
+                        Err(_) => {}
+                    }
+                }
+
+                // Update watched path.
+                if let Some(ref mut w) = self.watcher {
+                    if let Some(ref old) = self.current_file {
+                        let _ = w.unwatch(old);
+                    }
+                    let _ = w.watch(&path, RecursiveMode::NonRecursive);
+                }
+
+                // Update content.
+                self.source_text = content.clone();
+                self.markdown = content;
+                self.md_cache = CommonMarkCache::default();
+                self.settings.last_file = Some(path.to_string_lossy().into_owned());
+                self.status = path.to_string_lossy().into_owned();
+                self.current_file = Some(path);
+            }
+            Err(e) => {
+                self.status = format!("Error: {e}");
+            }
+        }
+    }
+
+    fn reload_current(&mut self) {
+        if let Some(path) = self.current_file.clone() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                self.source_text = content.clone();
+                self.markdown = content;
+                self.md_cache = CommonMarkCache::default();
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ theme
+
+    fn apply_scheme(&self, ctx: &egui::Context) {
+        match self.settings.color_scheme {
+            ColorScheme::Light => ctx.set_visuals(egui::Visuals::light()),
+            ColorScheme::Dark => ctx.set_visuals(egui::Visuals::dark()),
+            ColorScheme::Auto => {
+                // eframe sets the initial visuals from the OS; leave them as-is.
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ UI helpers
+
+    /// Draw the toolbar. Returns `(open_requested, scheme_changed)`.
+    fn toolbar_ui(&mut self, ui: &mut egui::Ui) -> (bool, bool) {
+        let mut open_requested = false;
+        let mut scheme_changed = false;
+
+        ui.horizontal(|ui| {
+            if ui.button("Open").on_hover_text("Open a Markdown file (Ctrl+O)").clicked() {
+                open_requested = true;
+            }
+
+            ui.separator();
+
+            ui.selectable_value(&mut self.settings.view_mode, ViewMode::Normal,    "Normal");
+            ui.selectable_value(&mut self.settings.view_mode, ViewMode::Decorated, "Decorated");
+            ui.selectable_value(&mut self.settings.view_mode, ViewMode::Source,    "Source");
+
+            ui.separator();
+
+            ui.checkbox(&mut self.settings.word_wrap, "Wrap");
+
+            ui.separator();
+
+            ui.label("Size:");
+            ui.add(
+                egui::DragValue::new(&mut self.settings.font_size)
+                    .range(8.0..=72.0_f32)
+                    .speed(0.5)
+                    .suffix("pt"),
+            );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = match self.settings.color_scheme {
+                    ColorScheme::Auto  => "Auto",
+                    ColorScheme::Light => "Light",
+                    ColorScheme::Dark  => "Dark",
+                };
+                if ui.button(label).on_hover_text("Color scheme: Auto / Light / Dark").clicked() {
+                    self.settings.color_scheme = match self.settings.color_scheme {
+                        ColorScheme::Auto  => ColorScheme::Light,
+                        ColorScheme::Light => ColorScheme::Dark,
+                        ColorScheme::Dark  => ColorScheme::Auto,
+                    };
+                    scheme_changed = true;
+                }
+            });
+        });
+
+        (open_requested, scheme_changed)
+    }
+
+    /// Draw the main content area.
+    fn content_ui(&mut self, ui: &mut egui::Ui) {
+        if self.markdown.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("Drop a Markdown file here, or click Open");
+            });
+            return;
+        }
+
+        let font_size = self.settings.font_size.max(8.0);
+
+        // Apply per-panel font size without touching the global style.
+        let mut style = (*ui.ctx().style()).clone();
+        for (ts, fid) in style.text_styles.iter_mut() {
+            if *ts == egui::TextStyle::Body || *ts == egui::TextStyle::Small {
+                fid.size = font_size;
+            } else if *ts == egui::TextStyle::Heading {
+                fid.size = font_size * 1.6;
+            }
+        }
+        ui.set_style(style);
+
+        match self.settings.view_mode {
+            ViewMode::Normal => {
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if self.settings.word_wrap {
+                            ui.set_max_width(ui.available_width());
+                        }
+                        CommonMarkViewer::new("md_normal")
+                            .show(ui, &mut self.md_cache, &self.markdown);
+                    });
+            }
+
+            ViewMode::Decorated => {
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let frame = egui::Frame {
+                            fill: ui.visuals().extreme_bg_color,
+                            inner_margin: egui::Margin::same(28.0),
+                            rounding: egui::Rounding::same(6.0),
+                            ..Default::default()
+                        };
+                        frame.show(ui, |ui| {
+                            if self.settings.word_wrap {
+                                ui.set_max_width(ui.available_width().min(840.0));
+                            }
+                            CommonMarkViewer::new("md_decorated")
+                                .show(ui, &mut self.md_cache, &self.markdown);
+                        });
+                    });
+            }
+
+            ViewMode::Source => {
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let desired_width = if self.settings.word_wrap {
+                            ui.available_width()
+                        } else {
+                            f32::INFINITY
+                        };
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.source_text)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(desired_width)
+                                .interactive(false),
+                        );
+                    });
+            }
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ---- Check for file-watcher reload signals ----
+        let mut changed = false;
+        while self.reload_rx.try_recv().is_ok() {
+            changed = true;
+        }
+        if changed {
+            self.reload_current();
+        }
+
+        // ---- Handle drag-and-drop (extract path before panel closures) ----
+        let dropped: Option<PathBuf> = ctx.input(|i| {
+            i.raw.dropped_files.first().and_then(|f| f.path.clone())
+        });
+
+        // ---- Toolbar ----
+        let (open_requested, scheme_changed) =
+            egui::TopBottomPanel::top("toolbar")
+                .show(ctx, |ui| self.toolbar_ui(ui))
+                .inner;
+
+        if scheme_changed {
+            self.apply_scheme(ctx);
+        }
+
+        // ---- Status bar ----
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            ui.label(&self.status);
+        });
+
+        // ---- Content ----
+        egui::CentralPanel::default().show(ctx, |ui| {
+            self.content_ui(ui);
+        });
+
+        // ---- Post-render: handle file opens (after all panels are done) ----
+        if let Some(path) = dropped {
+            self.open_file(path, ctx);
+        }
+
+        if open_requested || self.open_dialog {
+            self.open_dialog = false;
+            let start_dir = self
+                .current_file
+                .as_deref()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf());
+
+            let mut dialog = rfd::FileDialog::new()
+                .add_filter("Markdown", &["md", "markdown", "txt"])
+                .add_filter("All files", &["*"]);
+            if let Some(dir) = start_dir {
+                dialog = dialog.set_directory(dir);
+            }
+            if let Some(path) = dialog.pick_file() {
+                self.open_file(path, ctx);
+            }
+        }
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, "settings", &self.settings);
+    }
+}

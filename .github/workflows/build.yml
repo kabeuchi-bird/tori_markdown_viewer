@@ -13,80 +13,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ------------------------------------------------------------------ deps
-      - name: Install build dependencies
+      # Rust toolchain
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Cache Cargo registry + build artifacts
+      - uses: Swatinem/rust-cache@v2
+
+      # System libraries needed by eframe (xcb, xkbcommon) and rfd (xdg-portal via dbus)
+      - name: Install system dependencies
         run: |
           sudo apt-get update -q
           sudo apt-get install -y \
-            cmake \
-            ninja-build \
-            qt6-base-dev \
-            qt6-declarative-dev \
-            qt6-webengine-dev \
-            libmd4c-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
             libxkbcommon-dev \
-            libgl-dev \
-            imagemagick
+            libdbus-1-dev \
+            pkg-config
 
       # ------------------------------------------------------------------ build
-      - name: Configure
-        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build
-        run: cmake --build build --parallel
-
-      # ------------------------------------------------------------------ AppImage
-      - name: Download linuxdeploy tools
-        run: |
-          wget -q \
-            "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage" \
-            "https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage"
-          chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage
-
-      - name: Prepare AppDir
-        run: |
-          install -Dm755 build/tori_markdown_viewer \
-            AppDir/usr/bin/tori_markdown_viewer
-
-          # Desktop entry
-          mkdir -p AppDir/usr/share/applications
-          cat > AppDir/usr/share/applications/tori-markdown-viewer.desktop << 'EOF'
-          [Desktop Entry]
-          Name=tori markdown viewer
-          Comment=Markdown viewer for KDE Plasma
-          Exec=tori_markdown_viewer %f
-          Icon=tori-markdown-viewer
-          Type=Application
-          Categories=Utility;TextEditor;
-          MimeType=text/markdown;text/x-markdown;
-          StartupNotify=true
-          EOF
-
-          # App icon (256×256 PNG)
-          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
-          convert -size 256x256 \
-            gradient:'#667eea-#764ba2' \
-            -fill white -font DejaVu-Sans-Bold -pointsize 88 \
-            -gravity Center -annotate 0 'MD' \
-            AppDir/usr/share/icons/hicolor/256x256/apps/tori-markdown-viewer.png
-
-      - name: Build AppImage
-        env:
-          APPIMAGE_EXTRACT_AND_RUN: "1"   # work around FUSE not being available in CI
-        run: |
-          QMAKE=qmake6 \
-          EXTRA_QT_PLUGINS="webenginewidgets;webengine" \
-          ./linuxdeploy-x86_64.AppImage \
-            --appdir AppDir \
-            --plugin qt \
-            --output appimage
+      - name: Build (release)
+        run: cargo build --release
 
       # ------------------------------------------------------------------ artifact (every push)
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: tori_markdown_viewer-linux-x86_64
-          path: tori_markdown_viewer-*.AppImage
+          path: target/release/tori_markdown_viewer
           if-no-files-found: error
           retention-days: 30
 
@@ -96,6 +50,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            tori_markdown_viewer-*.AppImage
+            target/release/tori_markdown_viewer
             README.md
           generate_release_notes: true
