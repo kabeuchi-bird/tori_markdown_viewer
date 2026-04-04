@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=tori markdown viewer
+GenericName=Markdown Viewer
+Comment=Markdown file viewer for Linux
+Exec=tori_markdown_viewer %f
+Icon=tori_markdown_viewer
+MimeType=text/markdown;text/x-markdown;
+Categories=Utility;Viewer;TextEditor;
+Keywords=markdown;viewer;text;
+StartupNotify=true

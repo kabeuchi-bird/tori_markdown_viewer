@@ -19,7 +19,8 @@ jobs:
       # Cache Cargo registry + build artifacts
       - uses: Swatinem/rust-cache@v2
 
-      # System libraries needed by eframe (xcb, xkbcommon) and rfd (xdg-portal via dbus)
+      # System libraries needed by eframe (xcb, xkbcommon), rfd (xdg-portal via dbus),
+      # fontconfig (fc-match for OS default font), and AppImage tooling (rsvg-convert)
       - name: Install system dependencies
         run: |
           sudo apt-get update -q
@@ -30,18 +31,54 @@ jobs:
             libxkbcommon-dev \
             libdbus-1-dev \
             libgtk-3-dev \
-            pkg-config
+            pkg-config \
+            fontconfig \
+            librsvg2-bin \
+            file
 
       # ------------------------------------------------------------------ build
       - name: Build (release)
         run: cargo build --release
+
+      # ------------------------------------------------------------------ AppImage
+      - name: Build AppImage
+        run: |
+          # Download linuxdeploy
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+          # linuxdeploy itself is an AppImage; extract so it runs without FUSE
+          ./linuxdeploy-x86_64.AppImage --appimage-extract
+          LINUXDEPLOY="$(pwd)/squashfs-root/AppRun"
+
+          # Convert SVG icon to PNG
+          rsvg-convert -w 256 -h 256 assets/tori_markdown_viewer.svg \
+            -o tori_markdown_viewer.png
+
+          # Assemble AppDir
+          mkdir -p AppDir/usr/bin \
+                   AppDir/usr/share/applications \
+                   AppDir/usr/share/icons/hicolor/256x256/apps
+          cp target/release/tori_markdown_viewer AppDir/usr/bin/
+          cp assets/tori_markdown_viewer.desktop  AppDir/usr/share/applications/
+          cp tori_markdown_viewer.png              AppDir/usr/share/icons/hicolor/256x256/apps/
+
+          # Build AppImage
+          ARCH=x86_64 "$LINUXDEPLOY" \
+            --appdir AppDir \
+            --output appimage
+
+          # Rename to a versioned filename
+          TAG="${GITHUB_REF_NAME:-dev}"
+          mv tori_markdown_viewer-*.AppImage \
+             "tori_markdown_viewer-${TAG}-x86_64.AppImage" 2>/dev/null || true
+          ls -lh ./*.AppImage
 
       # ------------------------------------------------------------------ artifact (every push)
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: tori_markdown_viewer-linux-x86_64
-          path: target/release/tori_markdown_viewer
+          path: "*.AppImage"
           if-no-files-found: error
           retention-days: 30
 
@@ -51,5 +88,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            target/release/tori_markdown_viewer
+            *.AppImage
             README.md
