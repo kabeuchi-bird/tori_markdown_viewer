@@ -31,6 +31,8 @@ pub struct App {
     // Font selection
     /// All system font family names, sorted alphabetically.
     font_families: Vec<String>,
+    /// System default font family detected via fontconfig (fc-match), if available.
+    system_default_font: Option<String>,
     /// Search string for the font ComboBox popup.
     font_search: String,
     /// Which font was last applied to egui so we don't call set_fonts every frame.
@@ -52,6 +54,7 @@ impl App {
 
         // Enumerate system fonts once at startup.
         let font_families = enumerate_system_fonts();
+        let system_default_font = detect_system_default_font();
 
         let mut app = Self {
             markdown: String::new(),
@@ -64,6 +67,7 @@ impl App {
             status: "No file open — drop a Markdown file here or click Open".into(),
             open_dialog: false,
             font_families,
+            system_default_font,
             font_search: String::new(),
             last_applied_font: None,
             loaded_font_data: None,
@@ -162,7 +166,8 @@ impl App {
     // ------------------------------------------------------------------ font
 
     /// Load the font matching `settings.font_family` and register it with egui.
-    /// When `font_family` is None the egui built-in fonts are used (system default fallback).
+    /// When `font_family` is None, the OS default font (via fontconfig) is used;
+    /// falls back to egui built-in fonts if detection or loading fails.
     fn apply_font(&mut self, ctx: &egui::Context) {
         let desired = self.settings.font_family.clone();
 
@@ -170,35 +175,38 @@ impl App {
             return; // Nothing changed.
         }
 
-        match &desired {
+        // Resolve which family to actually load.
+        let family_to_load: Option<&str> = match &desired {
+            Some(name) => Some(name.as_str()),
+            None => self.system_default_font.as_deref(),
+        };
+
+        match family_to_load.and_then(|name| load_font_data(name)) {
+            Some(data) => {
+                let mut fonts = egui::FontDefinitions::default();
+                let key = "user_font".to_owned();
+                fonts.font_data.insert(
+                    key.clone(),
+                    egui::FontData::from_owned(data.clone()).into(),
+                );
+                // Prepend our font so it takes priority over the built-ins.
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, key.clone());
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Monospace)
+                    .or_default()
+                    .insert(0, key.clone());
+                ctx.set_fonts(fonts);
+                self.loaded_font_data = Some(data);
+            }
             None => {
-                // Reset to egui's built-in fonts.
+                // System font not found or no fontconfig; fall back to egui built-ins.
                 ctx.set_fonts(egui::FontDefinitions::default());
                 self.loaded_font_data = None;
-            }
-            Some(family_name) => {
-                if let Some(data) = load_font_data(family_name) {
-                    let mut fonts = egui::FontDefinitions::default();
-                    let key = "user_font".to_owned();
-                    fonts.font_data.insert(
-                        key.clone(),
-                        egui::FontData::from_owned(data.clone()).into(),
-                    );
-                    // Prepend our font so it takes priority over the built-ins.
-                    fonts
-                        .families
-                        .entry(egui::FontFamily::Proportional)
-                        .or_default()
-                        .insert(0, key.clone());
-                    fonts
-                        .families
-                        .entry(egui::FontFamily::Monospace)
-                        .or_default()
-                        .insert(0, key.clone());
-                    ctx.set_fonts(fonts);
-                    self.loaded_font_data = Some(data);
-                }
-                // If load fails, silently keep the current font.
             }
         }
 
@@ -242,11 +250,12 @@ impl App {
 
             // ---- Font selector ----
             ui.label("Font:");
-            let current_label = self
-                .settings
-                .font_family
-                .clone()
-                .unwrap_or_else(|| "System default".to_owned());
+            let current_label = self.settings.font_family.clone().unwrap_or_else(|| {
+                match &self.system_default_font {
+                    Some(name) => format!("{name} (OS default)"),
+                    None => "System default".to_owned(),
+                }
+            });
 
             egui::ComboBox::from_id_source("font_selector")
                 .selected_text(&current_label)
@@ -449,6 +458,22 @@ impl eframe::App for App {
 }
 
 // ------------------------------------------------------------------ font helpers
+
+/// Ask fontconfig for the default sans-serif font family.
+/// Returns None if fc-match is unavailable or fails.
+fn detect_system_default_font() -> Option<String> {
+    let output = std::process::Command::new("fc-match")
+        .args(["--format=%{family}", "sans"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // fc-match may return a comma-separated list; take the first entry.
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let family = raw.split(',').next()?.trim().to_owned();
+    if family.is_empty() { None } else { Some(family) }
+}
 
 /// Return a sorted list of all system font family names.
 fn enumerate_system_fonts() -> Vec<String> {
