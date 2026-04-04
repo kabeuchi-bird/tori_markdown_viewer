@@ -54,7 +54,8 @@ impl App {
 
         // Enumerate system fonts once at startup.
         let font_families = enumerate_system_fonts();
-        let system_default_font = detect_system_default_font();
+        // Font detection chain: DE setting → fontconfig → None (egui built-ins).
+        let system_default_font = detect_de_font().or_else(detect_system_default_font);
 
         let mut app = Self {
             markdown: String::new(),
@@ -459,6 +460,194 @@ impl eframe::App for App {
 }
 
 // ------------------------------------------------------------------ font helpers
+
+// ---- Desktop-environment font detection ----
+
+/// Top-level: try to read the font configured in the current DE.
+/// Returns None if the DE is undetected or if all DE-specific probes fail.
+fn detect_de_font() -> Option<String> {
+    // Collect DE hints from the two most common env vars.
+    let xdg = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_uppercase();
+    let ds  = std::env::var("DESKTOP_SESSION").unwrap_or_default().to_uppercase();
+    let hint = format!("{xdg}:{ds}");
+
+    // Try the DE-specific method first, then probe all as a last resort.
+    if hint.contains("CINNAMON") {
+        detect_cinnamon_font().or_else(detect_gnome_font)
+    } else if hint.contains("GNOME")
+           || hint.contains("UBUNTU")
+           || hint.contains("BUDGIE")
+           || hint.contains("PANTHEON")
+    {
+        detect_gnome_font()
+    } else if hint.contains("MATE") {
+        detect_mate_font()
+    } else if hint.contains("KDE") {
+        detect_kde_font()
+    } else if hint.contains("XFCE") {
+        detect_xfce_font()
+    } else if hint.contains("LXQT") {
+        detect_lxqt_font()
+    } else {
+        // Unknown DE — try each method in order.
+        detect_gnome_font()
+            .or_else(detect_cinnamon_font)
+            .or_else(detect_mate_font)
+            .or_else(detect_kde_font)
+            .or_else(detect_xfce_font)
+            .or_else(detect_lxqt_font)
+    }
+}
+
+/// GNOME / Ubuntu / Budgie / Pantheon: read via gsettings.
+fn detect_gnome_font() -> Option<String> {
+    let raw = run_command(
+        "gsettings",
+        &["get", "org.gnome.desktop.interface", "font-name"],
+    )?;
+    parse_gtk_font_name(&raw)
+}
+
+/// Cinnamon: read via gsettings.
+fn detect_cinnamon_font() -> Option<String> {
+    let raw = run_command(
+        "gsettings",
+        &["get", "org.cinnamon.desktop.interface", "font-name"],
+    )?;
+    parse_gtk_font_name(&raw)
+}
+
+/// MATE: read via gsettings.
+fn detect_mate_font() -> Option<String> {
+    let raw = run_command(
+        "gsettings",
+        &["get", "org.mate.interface", "font-name"],
+    )?;
+    parse_gtk_font_name(&raw)
+}
+
+/// KDE Plasma: read from ~/.config/kdeglobals (INI, [General] > font).
+fn detect_kde_font() -> Option<String> {
+    let path = dirs_config()?.join("kdeglobals");
+    let raw = read_ini_font(&path, "General", "font")?;
+    parse_qt_font_name(&raw)
+}
+
+/// XFCE: try xfconf-query first, fall back to xsettings.xml.
+fn detect_xfce_font() -> Option<String> {
+    // Primary: xfconf-query
+    if let Some(raw) = run_command(
+        "xfconf-query",
+        &["-c", "xsettings", "-p", "/Gtk/FontName"],
+    ) {
+        if let Some(name) = parse_gtk_font_name(&raw) {
+            return Some(name);
+        }
+    }
+
+    // Fallback: parse XML config file
+    let path = dirs_config()?
+        .join("xfce4/xfconf/xfce-perchannel-xml/xsettings.xml");
+    let xml = std::fs::read_to_string(path).ok()?;
+    // Find: <property name="FontName" type="string" value="Noto Sans 11"/>
+    for line in xml.lines() {
+        if line.contains(r#"name="FontName""#) {
+            if let Some(v) = extract_xml_attr(line, "value") {
+                return parse_gtk_font_name(&v);
+            }
+        }
+    }
+    None
+}
+
+/// LXQt: read from ~/.config/lxqt/lxqt.conf (INI, [General] > font).
+fn detect_lxqt_font() -> Option<String> {
+    let path = dirs_config()?.join("lxqt/lxqt.conf");
+    let raw = read_ini_font(&path, "General", "font")?;
+    parse_qt_font_name(&raw)
+}
+
+// ---- Parsing helpers ----
+
+/// Parse GTK-style font string: `'Noto Sans 11'` or `"Ubuntu 12"` → `"Noto Sans"`.
+/// Strips surrounding quotes/whitespace, then removes the trailing point-size token.
+fn parse_gtk_font_name(s: &str) -> Option<String> {
+    let s = s.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Font name may end with a size token (pure digits), e.g. "Noto Sans 11".
+    // Strip it if present, keeping compound names like "DejaVu Sans Condensed 10".
+    let family = match s.rsplit_once(' ') {
+        Some((family, size)) if size.chars().all(|c| c.is_ascii_digit()) => family.trim(),
+        _ => s,
+    };
+    if family.is_empty() { None } else { Some(family.to_owned()) }
+}
+
+/// Parse Qt-style font string: `Noto Sans,10,-1,5,50,0,0,0,0,0` → `"Noto Sans"`.
+fn parse_qt_font_name(s: &str) -> Option<String> {
+    let family = s.trim().split(',').next()?.trim().to_owned();
+    if family.is_empty() { None } else { Some(family) }
+}
+
+/// Read an INI file and return the value for `key` inside `[section]`.
+/// Handles both `key=value` and `key = value` with optional whitespace.
+fn read_ini_font(path: &std::path::Path, section: &str, key: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let section_header = format!("[{section}]");
+    let mut in_section = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_section = trimmed.eq_ignore_ascii_case(&section_header);
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some((k, v)) = trimmed.split_once('=') {
+            if k.trim().eq_ignore_ascii_case(key) {
+                return Some(v.trim().to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Extract the value of an XML attribute from a single line, e.g. `value="Noto Sans 11"`.
+fn extract_xml_attr<'a>(line: &'a str, attr: &str) -> Option<&'a str> {
+    let needle = format!(r#"{attr}=""#);
+    let start = line.find(needle.as_str())? + needle.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+/// Run an external command and return its stdout as a trimmed String, or None on failure.
+fn run_command(program: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Returns the XDG config directory (`$XDG_CONFIG_HOME` or `~/.config`).
+fn dirs_config() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
+        })
+}
+
+// ---- fontconfig fallback ----
 
 /// Ask fontconfig for the default sans-serif font family.
 /// Returns None if fc-match is unavailable or fails.
