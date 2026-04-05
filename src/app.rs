@@ -708,11 +708,51 @@ fn enumerate_and_collect_fonts() -> (Vec<String>, Vec<Vec<u8>>) {
             }
         }
         if fallbacks.len() >= 6 {
-            break; // cap to avoid excessive memory use
+            break;
         }
     }
 
+    // Additionally, ask fontconfig which fonts cover each decoration character.
+    // This guarantees display even when none of the priority fonts are installed.
+    for data in collect_deco_fonts() {
+        if fallbacks.len() >= 10 {
+            break;
+        }
+        fallbacks.push(data);
+    }
+
     (families, fallbacks)
+}
+
+/// Use `fc-match :charset=XXXX` to find the best font covering each decoration
+/// character. Returns unique font file data not already in the priority list.
+fn collect_deco_fonts() -> Vec<Vec<u8>> {
+    // Codepoints used in H*_DECO that are absent from Ubuntu Light / Hack.
+    const DECO_CPS: &[u32] = &[
+        0x273C, // ✼  OPEN CENTRE TEARDROP-SPOKED ASTERISK
+        0x2508, // ┈  BOX DRAWINGS LIGHT QUADRUPLE DASH HORIZONTAL
+        0x2726, // ✦  BLACK FOUR POINTED STAR
+        0x273B, // ✻  TEARDROP-SPOKED ASTERISK
+        0x2724, // ✤  HEAVY FOUR BALLOON-SPOKED ASTERISK
+        0x2767, // ❧  ROTATED FLORAL HEART BULLET
+        0x273F, // ✿  BLACK FLORETTE
+    ];
+
+    let mut seen: std::collections::HashSet<String> = Default::default();
+    let mut result: Vec<Vec<u8>> = Vec::new();
+
+    for &cp in DECO_CPS {
+        let pattern = format!(":charset={cp:X}");
+        if let Some(path) = run_command("fc-match", &["--format=%{file}", &pattern]) {
+            if seen.insert(path.clone()) {
+                if let Ok(data) = std::fs::read(&path) {
+                    result.push(data);
+                }
+            }
+        }
+    }
+
+    result
 }
 
 // ------------------------------------------------------------------ decorated mode
@@ -832,19 +872,28 @@ fn decorate_markdown(text: &str) -> String {
     out
 }
 
-/// Load raw font bytes for the first face matching the given family name.
+/// Load raw font bytes for a family name.
+///
+/// Tries an exact case-insensitive match first. If that fails, strips the
+/// trailing word and retries — this handles DE font strings like
+/// `"Noto Sans DemiLight"` where fontdb stores the family as `"Noto Sans"`.
 fn load_font_data(family_name: &str) -> Option<Vec<u8>> {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
+    load_font_from_db(&db, family_name)
+}
 
-    // Find a face whose primary family matches.
-    let face_id = db.faces().find(|f| {
-        f.families
-            .first()
-            .map_or(false, |(n, _)| n.eq_ignore_ascii_case(family_name))
-    })?
-    .id;
-
-    // fontdb can give us the raw bytes directly.
-    db.with_face_data(face_id, |data, _index| data.to_vec())
+fn load_font_from_db(db: &fontdb::Database, family_name: &str) -> Option<Vec<u8>> {
+    let mut candidate = family_name;
+    loop {
+        if let Some(face) = db.faces().find(|f| {
+            f.families.first().map_or(false, |(n, _)| n.eq_ignore_ascii_case(candidate))
+        }) {
+            return db.with_face_data(face.id, |data, _| data.to_vec());
+        }
+        // Strip last word (e.g. "DemiLight", "Bold", "Italic", "Light") and retry.
+        let trimmed = candidate.trim_end();
+        let pos = trimmed.rfind(' ')?; // no space left → family not found
+        candidate = &trimmed[..pos];
+    }
 }
