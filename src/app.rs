@@ -738,7 +738,10 @@ fn decorate_markdown(text: &str) -> String {
             let hashes = &trimmed[..level];
             match level {
                 1 => {
-                    out.push('\n');
+                    // Blank separator only when preceded by other content.
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
                     out.push_str(H1_DECO);
                     out.push_str("\n\n");
                     out.push_str(hashes);
