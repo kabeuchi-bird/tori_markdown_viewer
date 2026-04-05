@@ -689,7 +689,7 @@ fn enumerate_system_fonts() -> Vec<String> {
 // ------------------------------------------------------------------ decorated mode
 
 const H1_DECO: &str   = "✼••┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈••✼";
-const H2_DECO: &str   = "˖✻*˸ꕤ*˸*⋆。";
+const H2_DECO: &str   = "✦·✻·✤·✻·✦";
 const H3_DECO: &str   = "✦";
 const H4_DECO: &str   = "❧";
 const H5_DECO: &str   = "✿";
