@@ -37,8 +37,8 @@ pub struct App {
     font_search: String,
     /// Which font was last applied to egui so we don't call set_fonts every frame.
     last_applied_font: Option<String>,
-    /// Raw font data for the currently applied font (kept alive for egui).
-    loaded_font_data: Option<Vec<u8>>,
+    /// System fonts loaded at startup and appended as Unicode fallbacks.
+    fallback_fonts: Vec<Vec<u8>>,
 }
 
 impl App {
@@ -52,8 +52,8 @@ impl App {
         // (on first file open) so we can capture the egui Context.
         let (_tx_placeholder, rx) = mpsc::sync_channel::<()>(0);
 
-        // Enumerate system fonts once at startup.
-        let font_families = enumerate_system_fonts();
+        // Enumerate system fonts once at startup (shared DB avoids rebuilding twice).
+        let (font_families, fallback_fonts) = enumerate_and_collect_fonts();
         // Font detection chain: DE setting → fontconfig → None (egui built-ins).
         let system_default_font = detect_de_font().or_else(detect_system_default_font);
 
@@ -71,7 +71,7 @@ impl App {
             system_default_font,
             font_search: String::new(),
             last_applied_font: None,
-            loaded_font_data: None,
+            fallback_fonts,
         };
 
         // Apply the saved color scheme before the first frame.
@@ -172,9 +172,10 @@ impl App {
 
     // ------------------------------------------------------------------ font
 
-    /// Load the font matching `settings.font_family` and register it with egui.
-    /// When `font_family` is None, the OS default font (via fontconfig) is used;
-    /// falls back to egui built-in fonts if detection or loading fails.
+    /// Rebuild egui's FontDefinitions with:
+    ///   1. User/system-default font prepended (highest priority)
+    ///   2. egui built-in fonts (middle)
+    ///   3. System fallback fonts appended (lowest priority, Unicode coverage)
     fn apply_font(&mut self, ctx: &egui::Context) {
         let desired = self.settings.font_family.clone();
 
@@ -182,41 +183,33 @@ impl App {
             return; // Nothing changed.
         }
 
-        // Resolve which family to actually load.
+        // Resolve which family to actually load as the primary font.
         let family_to_load: Option<&str> = match &desired {
             Some(name) => Some(name.as_str()),
             None => self.system_default_font.as_deref(),
         };
 
-        match family_to_load.and_then(|name| load_font_data(name)) {
-            Some(data) => {
-                let mut fonts = egui::FontDefinitions::default();
-                let key = "user_font".to_owned();
-                fonts.font_data.insert(
-                    key.clone(),
-                    egui::FontData::from_owned(data.clone()).into(),
-                );
-                // Prepend our font so it takes priority over the built-ins.
-                fonts
-                    .families
-                    .entry(egui::FontFamily::Proportional)
-                    .or_default()
-                    .insert(0, key.clone());
-                fonts
-                    .families
-                    .entry(egui::FontFamily::Monospace)
-                    .or_default()
-                    .insert(0, key.clone());
-                ctx.set_fonts(fonts);
-                self.loaded_font_data = Some(data);
-            }
-            None => {
-                // System font not found or no fontconfig; fall back to egui built-ins.
-                ctx.set_fonts(egui::FontDefinitions::default());
-                self.loaded_font_data = None;
-            }
+        // Start from egui defaults so built-in fonts remain in the middle.
+        let mut fonts = egui::FontDefinitions::default();
+
+        // --- Primary font (prepended → highest priority) ---
+        if let Some(data) = family_to_load.and_then(|n| load_font_data(n)) {
+            let key = "user_font".to_owned();
+            fonts.font_data.insert(key.clone(), egui::FontData::from_owned(data).into());
+            fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, key.clone());
+            fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, key);
         }
 
+        // --- System fallback fonts (appended → lowest priority) ---
+        // These cover Unicode ranges absent from the primary/built-in fonts.
+        for (i, data) in self.fallback_fonts.iter().enumerate() {
+            let key = format!("sys_fallback_{i}");
+            fonts.font_data.insert(key.clone(), egui::FontData::from_owned(data.clone()).into());
+            fonts.families.entry(egui::FontFamily::Proportional).or_default().push(key.clone());
+            fonts.families.entry(egui::FontFamily::Monospace).or_default().push(key);
+        }
+
+        ctx.set_fonts(fonts);
         self.last_applied_font = desired;
     }
 
@@ -671,19 +664,55 @@ fn detect_system_default_font() -> Option<String> {
     if family.is_empty() { None } else { Some(family) }
 }
 
-/// Return a sorted list of all system font family names.
-fn enumerate_system_fonts() -> Vec<String> {
+/// Build the fontdb once and return:
+///   - sorted list of all family names (for the font picker ComboBox)
+///   - raw font data for Unicode fallback fonts (in priority order)
+fn enumerate_and_collect_fonts() -> (Vec<String>, Vec<Vec<u8>>) {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
 
+    // All family names for the ComboBox.
     let mut families: Vec<String> = db
         .faces()
         .filter_map(|f| f.families.first().map(|(name, _)| name.clone()))
         .collect();
-
     families.sort_unstable();
     families.dedup();
-    families
+
+    // Fallback fonts: prioritise broad Unicode coverage.
+    // Noto fonts cover virtually all of Unicode by design.
+    // DejaVu/Liberation/Unifont fill in where Noto is absent.
+    let priority: &[&str] = &[
+        "Noto Sans",
+        "Noto Serif",
+        "Noto Sans CJK JP",
+        "Noto Sans CJK SC",
+        "Noto Sans CJK TC",
+        "Noto Sans CJK KR",
+        "Noto Color Emoji",
+        "Noto Emoji",
+        "DejaVu Sans",
+        "Liberation Sans",
+        "FreeSans",
+        "Symbola",   // exceptional symbol/historic script coverage
+        "Unifont",   // bitmap-backed, covers almost all of BMP
+    ];
+
+    let mut fallbacks: Vec<Vec<u8>> = Vec::new();
+    for &name in priority {
+        if let Some(face) = db.faces().find(|f| {
+            f.families.first().map_or(false, |(n, _)| n.eq_ignore_ascii_case(name))
+        }) {
+            if let Some(data) = db.with_face_data(face.id, |d, _| d.to_vec()) {
+                fallbacks.push(data);
+            }
+        }
+        if fallbacks.len() >= 6 {
+            break; // cap to avoid excessive memory use
+        }
+    }
+
+    (families, fallbacks)
 }
 
 // ------------------------------------------------------------------ decorated mode
