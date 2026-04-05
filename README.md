@@ -19,12 +19,6 @@ Linux（KDE Plasma）向けのMarkdownビューアです。
 - **コマンドライン引数** でファイルを指定して起動可能
 - **設定の永続化** — フォント・モード・ウィンドウサイズ等を次回起動時に復元
 
-## スクリーンショット
-
-| Normal（ライト） | Decorated（ダーク） |
-|:-:|:-:|
-| *(Normal Light)* | *(Decorated Dark)* |
-
 ## インストール
 
 ### AppImage（推奨）
