@@ -129,6 +129,9 @@ impl App {
                 }
 
                 // Update content.
+                // Strip UTF-8 BOM (\u{FEFF}) that some editors prepend; it
+                // would prevent pulldown-cmark from recognising the first `#`.
+                let content = content.strip_prefix('\u{FEFF}').map_or(content.clone(), str::to_owned);
                 self.source_text = content.clone();
                 self.markdown = content;
                 self.md_cache = CommonMarkCache::default();
@@ -795,20 +798,26 @@ fn render_decorated_content(
     let mut i = 0;
 
     while i < lines.len() {
-        // Detect H1 block: H1_DECO / # ... / H1_DECO
+        // decorate_markdown emits H1 blocks as:
+        //   H1_DECO \n\n # heading \n\n H1_DECO \n\n
+        // which str::lines() turns into five entries (plus a trailing ""):
+        //   [H1_DECO, "", "# heading", "", H1_DECO]
         if lines[i] == H1_DECO
-            && i + 2 < lines.len()
-            && lines[i + 1].starts_with("# ")
-            && lines[i + 2] == H1_DECO
+            && i + 4 < lines.len()
+            && lines[i + 1].is_empty()
+            && lines[i + 2].starts_with("# ")
+            && lines[i + 3].is_empty()
+            && lines[i + 4] == H1_DECO
         {
             if !buf.is_empty() {
                 segments.push((false, std::mem::take(&mut buf)));
             }
-            let block = format!("{}\n{}\n{}\n", lines[i], lines[i + 1], lines[i + 2]);
+            // Re-assemble with blank lines so CommonMark still sees the heading.
+            let block = format!("{}\n\n{}\n\n{}\n", lines[i], lines[i + 2], lines[i + 4]);
             segments.push((true, block));
-            i += 3;
-            // Swallow a blank separator line if present.
-            if i < lines.len() && lines[i].is_empty() {
+            i += 5;
+            // Swallow trailing blank separator lines.
+            while i < lines.len() && lines[i].is_empty() {
                 i += 1;
             }
         } else {
