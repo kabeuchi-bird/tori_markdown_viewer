@@ -1,6 +1,6 @@
 # tori markdown viewer
 
-Linux（KDE Plasma）向けのMarkdownビューアです。
+Linux向けのMarkdownビューアです。eguiを使用しているため、デスクトップ環境に依存せず動作します。
 
 ## 機能
 

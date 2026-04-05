@@ -161,13 +161,24 @@ impl App {
     // ------------------------------------------------------------------ theme
 
     fn apply_scheme(&self, ctx: &egui::Context) {
-        match self.settings.color_scheme {
-            ColorScheme::Light => ctx.set_visuals(egui::Visuals::light()),
-            ColorScheme::Dark => ctx.set_visuals(egui::Visuals::dark()),
-            ColorScheme::Auto => {
-                // eframe sets the initial visuals from the OS; leave them as-is.
-            }
-        }
+        let mut visuals = match self.settings.color_scheme {
+            ColorScheme::Light => egui::Visuals::light(),
+            ColorScheme::Dark => egui::Visuals::dark(),
+            ColorScheme::Auto => (*ctx.style()).visuals.clone(),
+        };
+
+        // Boost text contrast beyond egui's default.
+        // Dark theme: default body text is ~Color32::from_gray(200); lift to near-white.
+        // Light theme: default body text is ~Color32::from_gray(60); drop to near-black.
+        let text_color = if visuals.dark_mode {
+            egui::Color32::from_gray(242)
+        } else {
+            egui::Color32::from_gray(15)
+        };
+        visuals.widgets.noninteractive.fg_stroke.color = text_color;
+        visuals.widgets.inactive.fg_stroke.color = text_color;
+
+        ctx.set_visuals(visuals);
     }
 
     // ------------------------------------------------------------------ font
@@ -329,7 +340,8 @@ impl App {
             if *ts == egui::TextStyle::Body || *ts == egui::TextStyle::Small {
                 fid.size = font_size;
             } else if *ts == egui::TextStyle::Heading {
-                fid.size = font_size * 1.6;
+                // Larger ratio → more visible size steps between H1–H6.
+                fid.size = font_size * 2.2;
             }
         }
         ui.set_style(style);
@@ -362,8 +374,7 @@ impl App {
                                 ui.set_max_width(ui.available_width().min(840.0));
                             }
                             let decorated = decorate_markdown(&self.markdown);
-                            CommonMarkViewer::new("md_decorated")
-                                .show(ui, &mut self.md_cache, &decorated);
+                            render_decorated_content(ui, &mut self.md_cache, &decorated);
                         });
                     });
             }
@@ -762,6 +773,68 @@ const H2_DECO: &str   = "✦·✻·✤·✻·✦";
 const H3_DECO: &str   = "✦";
 const H4_DECO: &str   = "❧";
 const H5_DECO: &str   = "✿";
+
+/// Render decorated content, centering H1 blocks.
+///
+/// H1 blocks in decorated output have the shape:
+/// ```text
+/// H1_DECO
+/// # Heading text
+/// H1_DECO
+/// ```
+/// We split the document at those boundaries and render each H1 group in a
+/// centered layout; everything else is rendered left-aligned as usual.
+fn render_decorated_content(
+    ui: &mut egui::Ui,
+    cache: &mut CommonMarkCache,
+    decorated: &str,
+) {
+    let lines: Vec<&str> = decorated.lines().collect();
+    let mut segments: Vec<(bool, String)> = Vec::new(); // (centered, chunk)
+    let mut buf = String::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        // Detect H1 block: H1_DECO / # ... / H1_DECO
+        if lines[i] == H1_DECO
+            && i + 2 < lines.len()
+            && lines[i + 1].starts_with("# ")
+            && lines[i + 2] == H1_DECO
+        {
+            if !buf.is_empty() {
+                segments.push((false, std::mem::take(&mut buf)));
+            }
+            let block = format!("{}\n{}\n{}\n", lines[i], lines[i + 1], lines[i + 2]);
+            segments.push((true, block));
+            i += 3;
+            // Swallow a blank separator line if present.
+            if i < lines.len() && lines[i].is_empty() {
+                i += 1;
+            }
+        } else {
+            buf.push_str(lines[i]);
+            buf.push('\n');
+            i += 1;
+        }
+    }
+    if !buf.is_empty() {
+        segments.push((false, buf));
+    }
+
+    for (idx, (centered, chunk)) in segments.iter().enumerate() {
+        let viewer_id = format!("md_deco_{idx}");
+        if *centered {
+            ui.with_layout(
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    CommonMarkViewer::new(&viewer_id).show(ui, cache, chunk);
+                },
+            );
+        } else {
+            CommonMarkViewer::new(&viewer_id).show(ui, cache, chunk);
+        }
+    }
+}
 
 /// Pre-process Markdown text for Decorated mode by inserting ornamental
 /// decorations around headings. Code fences are left untouched.
