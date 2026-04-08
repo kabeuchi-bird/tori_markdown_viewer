@@ -153,7 +153,8 @@ impl App {
 
     fn reload_current(&mut self) {
         if let Some(path) = self.current_file.clone() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                let content = raw.strip_prefix('\u{FEFF}').map_or(raw.clone(), str::to_owned);
                 self.source_text = content.clone();
                 self.markdown = content;
                 self.md_cache = CommonMarkCache::default();
@@ -354,8 +355,13 @@ impl App {
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        if self.settings.word_wrap {
-                            ui.set_max_width(ui.available_width());
+                        // word_wrap=false: allow infinite horizontal extent so
+                        // CommonMarkViewer never wraps (available_width → ∞).
+                        // word_wrap=true: do NOT cap via set_max_width; let the
+                        // scroll-area's natural available_width control wrapping
+                        // so we never accidentally pass 0 on the first frame.
+                        if !self.settings.word_wrap {
+                            ui.set_max_width(f32::INFINITY);
                         }
                         CommonMarkViewer::new("md_normal")
                             .show(ui, &mut self.md_cache, &self.markdown);
@@ -380,7 +386,15 @@ impl App {
                             ui.set_style(inner_style);
 
                             if self.settings.word_wrap {
-                                ui.set_max_width(ui.available_width().min(840.0));
+                                // Cap at 840 px for comfortable reading width.
+                                // Guard against the 0-width first frame by only
+                                // capping when the value is actually meaningful.
+                                let w = ui.available_width();
+                                if w > 0.0 {
+                                    ui.set_max_width(w.min(840.0));
+                                }
+                            } else {
+                                ui.set_max_width(f32::INFINITY);
                             }
                             let preprocessed = preprocess_decorated(&self.markdown);
                             CommonMarkViewer::new("md_decorated")
