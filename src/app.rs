@@ -129,6 +129,9 @@ impl App {
                 }
 
                 // Update content.
+                // Strip UTF-8 BOM (\u{FEFF}) that some editors prepend; it
+                // would prevent pulldown-cmark from recognising the first `#`.
+                let content = content.strip_prefix('\u{FEFF}').map_or(content.clone(), str::to_owned);
                 self.source_text = content.clone();
                 self.markdown = content;
                 self.md_cache = CommonMarkCache::default();
@@ -161,13 +164,24 @@ impl App {
     // ------------------------------------------------------------------ theme
 
     fn apply_scheme(&self, ctx: &egui::Context) {
-        match self.settings.color_scheme {
-            ColorScheme::Light => ctx.set_visuals(egui::Visuals::light()),
-            ColorScheme::Dark => ctx.set_visuals(egui::Visuals::dark()),
-            ColorScheme::Auto => {
-                // eframe sets the initial visuals from the OS; leave them as-is.
-            }
-        }
+        let mut visuals = match self.settings.color_scheme {
+            ColorScheme::Light => egui::Visuals::light(),
+            ColorScheme::Dark => egui::Visuals::dark(),
+            ColorScheme::Auto => (*ctx.style()).visuals.clone(),
+        };
+
+        // Boost text contrast beyond egui's default.
+        // Dark theme: default body text is ~Color32::from_gray(200); lift to near-white.
+        // Light theme: default body text is ~Color32::from_gray(60); drop to near-black.
+        let text_color = if visuals.dark_mode {
+            egui::Color32::from_gray(242)
+        } else {
+            egui::Color32::from_gray(15)
+        };
+        visuals.widgets.noninteractive.fg_stroke.color = text_color;
+        visuals.widgets.inactive.fg_stroke.color = text_color;
+
+        ctx.set_visuals(visuals);
     }
 
     // ------------------------------------------------------------------ font
@@ -329,7 +343,8 @@ impl App {
             if *ts == egui::TextStyle::Body || *ts == egui::TextStyle::Small {
                 fid.size = font_size;
             } else if *ts == egui::TextStyle::Heading {
-                fid.size = font_size * 1.6;
+                // Larger ratio → more visible size steps between H1–H6.
+                fid.size = font_size * 2.2;
             }
         }
         ui.set_style(style);
@@ -361,9 +376,8 @@ impl App {
                             if self.settings.word_wrap {
                                 ui.set_max_width(ui.available_width().min(840.0));
                             }
-                            let decorated = decorate_markdown(&self.markdown);
                             CommonMarkViewer::new("md_decorated")
-                                .show(ui, &mut self.md_cache, &decorated);
+                                .show(ui, &mut self.md_cache, &self.markdown);
                         });
                     });
             }
@@ -422,6 +436,38 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.label(&self.status);
         });
+
+        // ---- TOC sidebar (Decorated mode only, file loaded) ----
+        // SidePanel must be added before CentralPanel.
+        if self.settings.view_mode == ViewMode::Decorated && !self.markdown.is_empty() {
+            let toc = extract_toc(&self.markdown);
+            let font_size = self.settings.font_size.max(8.0);
+            egui::SidePanel::left("toc_panel")
+                .resizable(true)
+                .min_width(120.0)
+                .default_width(200.0)
+                .show(ctx, |ui| {
+                    ui.add_space(6.0);
+                    ui.strong("Contents");
+                    ui.separator();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for entry in &toc {
+                            let indent = (entry.level - 1) as f32 * 10.0;
+                            ui.horizontal(|ui| {
+                                ui.add_space(indent);
+                                let size = font_size * match entry.level {
+                                    1 => 1.0,
+                                    2 => 0.9,
+                                    _ => 0.82,
+                                };
+                                let text = egui::RichText::new(&entry.title).size(size);
+                                let text = if entry.level <= 2 { text.strong() } else { text };
+                                ui.label(text);
+                            });
+                        }
+                    });
+                });
+        }
 
         // ---- Content ----
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -755,121 +801,39 @@ fn collect_deco_fonts() -> Vec<Vec<u8>> {
     result
 }
 
-// ------------------------------------------------------------------ decorated mode
+// ------------------------------------------------------------------ TOC helpers
 
-const H1_DECO: &str   = "✼••┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈••✼";
-const H2_DECO: &str   = "✦·✻·✤·✻·✦";
-const H3_DECO: &str   = "✦";
-const H4_DECO: &str   = "❧";
-const H5_DECO: &str   = "✿";
+struct TocEntry {
+    level: u8,
+    title: String,
+}
 
-/// Pre-process Markdown text for Decorated mode by inserting ornamental
-/// decorations around headings. Code fences are left untouched.
-fn decorate_markdown(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 512);
-    let mut in_code_block = false;
-
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-
-        // Toggle code-fence state; pass the fence line through unchanged.
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_code_block = !in_code_block;
-            out.push_str(line);
-            out.push('\n');
+/// Parse ATX headings from raw Markdown, skipping code fences.
+fn extract_toc(markdown: &str) -> Vec<TocEntry> {
+    let mut entries = Vec::new();
+    let mut in_code = false;
+    for line in markdown.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_code = !in_code;
             continue;
         }
-
-        if in_code_block {
-            out.push_str(line);
-            out.push('\n');
+        if in_code {
             continue;
         }
-
-        // Count leading '#' to find ATX heading level.
-        let level = trimmed.chars().take_while(|&c| c == '#').count();
-
-        if level > 0 && level <= 6 {
-            let after = &trimmed[level..];
-            // CommonMark requires either a space or end-of-line after the hashes.
-            let title = if after.starts_with(' ') {
-                // Strip trailing closing hashes (e.g., `## foo ##`)
-                after[1..].trim_end_matches(|c: char| c == '#' || c == ' ')
-            } else if after.is_empty() {
-                ""
-            } else {
-                // Not a valid ATX heading (e.g., `#nospace`); pass through.
-                out.push_str(line);
-                out.push('\n');
-                continue;
-            };
-
-            let hashes = &trimmed[..level];
-            match level {
-                1 => {
-                    // Blank separator only when preceded by other content.
-                    if !out.is_empty() {
-                        out.push('\n');
-                    }
-                    out.push_str(H1_DECO);
-                    out.push_str("\n\n");
-                    out.push_str(hashes);
-                    out.push(' ');
-                    out.push_str(title);
-                    out.push_str("\n\n");
-                    out.push_str(H1_DECO);
-                    out.push_str("\n\n");
-                }
-                2 => {
-                    out.push_str(hashes);
-                    out.push(' ');
-                    out.push_str(H2_DECO);
-                    out.push(' ');
-                    out.push_str(title);
-                    out.push(' ');
-                    out.push_str(H2_DECO);
-                    out.push('\n');
-                }
-                3 => {
-                    out.push_str(hashes);
-                    out.push(' ');
-                    out.push_str(H3_DECO);
-                    out.push(' ');
-                    out.push_str(title);
-                    out.push(' ');
-                    out.push_str(H3_DECO);
-                    out.push('\n');
-                }
-                4 => {
-                    out.push_str(hashes);
-                    out.push(' ');
-                    out.push_str(H4_DECO);
-                    out.push(' ');
-                    out.push_str(title);
-                    out.push(' ');
-                    out.push_str(H4_DECO);
-                    out.push('\n');
-                }
-                5 | 6 => {
-                    out.push_str(hashes);
-                    out.push(' ');
-                    out.push_str(H5_DECO);
-                    out.push(' ');
-                    out.push_str(title);
-                    out.push(' ');
-                    out.push_str(H5_DECO);
-                    out.push('\n');
-                }
-                _ => unreachable!(),
-            }
+        let level = t.chars().take_while(|&c| c == '#').count();
+        if level == 0 || level > 6 {
             continue;
         }
-
-        out.push_str(line);
-        out.push('\n');
+        let rest = &t[level..];
+        if rest.starts_with(' ') {
+            let title = rest[1..].trim_end_matches(|c: char| c == '#' || c == ' ');
+            entries.push(TocEntry { level: level as u8, title: title.to_owned() });
+        } else if rest.is_empty() {
+            entries.push(TocEntry { level: level as u8, title: String::new() });
+        }
     }
-
-    out
+    entries
 }
 
 /// Load raw font bytes for a family name.
