@@ -376,8 +376,8 @@ impl App {
                             if self.settings.word_wrap {
                                 ui.set_max_width(ui.available_width().min(840.0));
                             }
-                            let decorated = decorate_markdown(&self.markdown);
-                            render_decorated_content(ui, &mut self.md_cache, &decorated);
+                            CommonMarkViewer::new("md_decorated")
+                                .show(ui, &mut self.md_cache, &self.markdown);
                         });
                     });
             }
@@ -436,6 +436,38 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.label(&self.status);
         });
+
+        // ---- TOC sidebar (Decorated mode only, file loaded) ----
+        // SidePanel must be added before CentralPanel.
+        if self.settings.view_mode == ViewMode::Decorated && !self.markdown.is_empty() {
+            let toc = extract_toc(&self.markdown);
+            let font_size = self.settings.font_size.max(8.0);
+            egui::SidePanel::left("toc_panel")
+                .resizable(true)
+                .min_width(120.0)
+                .default_width(200.0)
+                .show(ctx, |ui| {
+                    ui.add_space(6.0);
+                    ui.strong("Contents");
+                    ui.separator();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for entry in &toc {
+                            let indent = (entry.level - 1) as f32 * 10.0;
+                            ui.horizontal(|ui| {
+                                ui.add_space(indent);
+                                let size = font_size * match entry.level {
+                                    1 => 1.0,
+                                    2 => 0.9,
+                                    _ => 0.82,
+                                };
+                                let text = egui::RichText::new(&entry.title).size(size);
+                                let text = if entry.level <= 2 { text.strong() } else { text };
+                                ui.label(text);
+                            });
+                        }
+                    });
+                });
+        }
 
         // ---- Content ----
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -769,189 +801,39 @@ fn collect_deco_fonts() -> Vec<Vec<u8>> {
     result
 }
 
-// ------------------------------------------------------------------ decorated mode
+// ------------------------------------------------------------------ TOC helpers
 
-const H1_DECO: &str   = "✼••┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈••✼";
-const H2_DECO: &str   = "✦·✻·✤·✻·✦";
-const H3_DECO: &str   = "✦";
-const H4_DECO: &str   = "❧";
-const H5_DECO: &str   = "✿";
-
-/// Render decorated content, centering H1 blocks.
-///
-/// H1 blocks in decorated output have the shape:
-/// ```text
-/// H1_DECO
-/// # Heading text
-/// H1_DECO
-/// ```
-/// We split the document at those boundaries and render each H1 group in a
-/// centered layout; everything else is rendered left-aligned as usual.
-fn render_decorated_content(
-    ui: &mut egui::Ui,
-    cache: &mut CommonMarkCache,
-    decorated: &str,
-) {
-    let lines: Vec<&str> = decorated.lines().collect();
-    let mut segments: Vec<(bool, String)> = Vec::new(); // (centered, chunk)
-    let mut buf = String::new();
-    let mut i = 0;
-
-    while i < lines.len() {
-        // decorate_markdown emits H1 blocks as:
-        //   H1_DECO \n\n # heading \n\n H1_DECO \n\n
-        // which str::lines() turns into five entries (plus a trailing ""):
-        //   [H1_DECO, "", "# heading", "", H1_DECO]
-        if lines[i] == H1_DECO
-            && i + 4 < lines.len()
-            && lines[i + 1].is_empty()
-            && lines[i + 2].starts_with("# ")
-            && lines[i + 3].is_empty()
-            && lines[i + 4] == H1_DECO
-        {
-            if !buf.is_empty() {
-                segments.push((false, std::mem::take(&mut buf)));
-            }
-            // Re-assemble with blank lines so CommonMark still sees the heading.
-            let block = format!("{}\n\n{}\n\n{}\n", lines[i], lines[i + 2], lines[i + 4]);
-            segments.push((true, block));
-            i += 5;
-            // Swallow trailing blank separator lines.
-            while i < lines.len() && lines[i].is_empty() {
-                i += 1;
-            }
-        } else {
-            buf.push_str(lines[i]);
-            buf.push('\n');
-            i += 1;
-        }
-    }
-    if !buf.is_empty() {
-        segments.push((false, buf));
-    }
-
-    for (idx, (centered, chunk)) in segments.iter().enumerate() {
-        let viewer_id = format!("md_deco_{idx}");
-        if *centered {
-            ui.with_layout(
-                egui::Layout::top_down(egui::Align::Center),
-                |ui| {
-                    CommonMarkViewer::new(&viewer_id).show(ui, cache, chunk);
-                },
-            );
-        } else {
-            CommonMarkViewer::new(&viewer_id).show(ui, cache, chunk);
-        }
-    }
+struct TocEntry {
+    level: u8,
+    title: String,
 }
 
-/// Pre-process Markdown text for Decorated mode by inserting ornamental
-/// decorations around headings. Code fences are left untouched.
-fn decorate_markdown(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 512);
-    let mut in_code_block = false;
-
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-
-        // Toggle code-fence state; pass the fence line through unchanged.
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_code_block = !in_code_block;
-            out.push_str(line);
-            out.push('\n');
+/// Parse ATX headings from raw Markdown, skipping code fences.
+fn extract_toc(markdown: &str) -> Vec<TocEntry> {
+    let mut entries = Vec::new();
+    let mut in_code = false;
+    for line in markdown.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_code = !in_code;
             continue;
         }
-
-        if in_code_block {
-            out.push_str(line);
-            out.push('\n');
+        if in_code {
             continue;
         }
-
-        // Count leading '#' to find ATX heading level.
-        let level = trimmed.chars().take_while(|&c| c == '#').count();
-
-        if level > 0 && level <= 6 {
-            let after = &trimmed[level..];
-            // CommonMark requires either a space or end-of-line after the hashes.
-            let title = if after.starts_with(' ') {
-                // Strip trailing closing hashes (e.g., `## foo ##`)
-                after[1..].trim_end_matches(|c: char| c == '#' || c == ' ')
-            } else if after.is_empty() {
-                ""
-            } else {
-                // Not a valid ATX heading (e.g., `#nospace`); pass through.
-                out.push_str(line);
-                out.push('\n');
-                continue;
-            };
-
-            let hashes = &trimmed[..level];
-            match level {
-                1 => {
-                    // Blank separator only when preceded by other content.
-                    if !out.is_empty() {
-                        out.push('\n');
-                    }
-                    out.push_str(H1_DECO);
-                    out.push_str("\n\n");
-                    out.push_str(hashes);
-                    out.push(' ');
-                    out.push_str(title);
-                    out.push_str("\n\n");
-                    out.push_str(H1_DECO);
-                    out.push_str("\n\n");
-                }
-                2 => {
-                    out.push_str(hashes);
-                    out.push(' ');
-                    out.push_str(H2_DECO);
-                    out.push(' ');
-                    out.push_str(title);
-                    out.push(' ');
-                    out.push_str(H2_DECO);
-                    out.push('\n');
-                }
-                3 => {
-                    out.push_str(hashes);
-                    out.push(' ');
-                    out.push_str(H3_DECO);
-                    out.push(' ');
-                    out.push_str(title);
-                    out.push(' ');
-                    out.push_str(H3_DECO);
-                    out.push('\n');
-                }
-                4 => {
-                    out.push_str(hashes);
-                    out.push(' ');
-                    out.push_str(H4_DECO);
-                    out.push(' ');
-                    out.push_str(title);
-                    out.push(' ');
-                    out.push_str(H4_DECO);
-                    out.push('\n');
-                }
-                5 | 6 => {
-                    out.push_str(hashes);
-                    out.push(' ');
-                    out.push_str(H5_DECO);
-                    out.push(' ');
-                    out.push_str(title);
-                    out.push(' ');
-                    out.push_str(H5_DECO);
-                    out.push('\n');
-                }
-                _ => unreachable!(),
-            }
+        let level = t.chars().take_while(|&c| c == '#').count();
+        if level == 0 || level > 6 {
             continue;
         }
-
-        out.push_str(line);
-        out.push('\n');
+        let rest = &t[level..];
+        if rest.starts_with(' ') {
+            let title = rest[1..].trim_end_matches(|c: char| c == '#' || c == ' ');
+            entries.push(TocEntry { level: level as u8, title: title.to_owned() });
+        } else if rest.is_empty() {
+            entries.push(TocEntry { level: level as u8, title: String::new() });
+        }
     }
-
-    out
+    entries
 }
 
 /// Load raw font bytes for a family name.
