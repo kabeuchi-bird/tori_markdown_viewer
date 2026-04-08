@@ -373,11 +373,18 @@ impl App {
                             ..Default::default()
                         };
                         frame.show(ui, |ui| {
+                            // Wider vertical spacing between headings and body text.
+                            // ui.style() is &Arc<Style>; double-deref to clone the Style.
+                            let mut inner_style = (**ui.style()).clone();
+                            inner_style.spacing.item_spacing.y = 8.0;
+                            ui.set_style(inner_style);
+
                             if self.settings.word_wrap {
                                 ui.set_max_width(ui.available_width().min(840.0));
                             }
+                            let preprocessed = preprocess_decorated(&self.markdown);
                             CommonMarkViewer::new("md_decorated")
-                                .show(ui, &mut self.md_cache, &self.markdown);
+                                .show(ui, &mut self.md_cache, &preprocessed);
                         });
                     });
             }
@@ -834,6 +841,41 @@ fn extract_toc(markdown: &str) -> Vec<TocEntry> {
         }
     }
     entries
+}
+
+/// Pre-process Markdown for Decorated mode.
+///
+/// Currently: inserts a horizontal rule (`---`) after every H1 heading so
+/// egui-commonmark renders a visible separator line below it.
+/// Code fences are left untouched.
+fn preprocess_decorated(markdown: &str) -> String {
+    let mut out = String::with_capacity(markdown.len() + 64);
+    let mut in_code = false;
+    for line in markdown.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_code = !in_code;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if in_code {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        // H1 = exactly one '#' followed by a space or end-of-line.
+        let hashes = t.chars().take_while(|&c| c == '#').count();
+        if hashes == 1 {
+            let rest = &t[1..];
+            if rest.is_empty() || rest.starts_with(' ') {
+                out.push_str("\n---\n");
+            }
+        }
+    }
+    out
 }
 
 /// Load raw font bytes for a family name.
