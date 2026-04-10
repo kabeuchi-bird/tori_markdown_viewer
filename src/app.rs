@@ -39,6 +39,9 @@ pub struct App {
     last_applied_font: Option<String>,
     /// System fonts loaded at startup and appended as Unicode fallbacks.
     fallback_fonts: Vec<Vec<u8>>,
+
+    /// TOC entry index to scroll to on the next frame (Decorated mode).
+    toc_scroll_target: Option<usize>,
 }
 
 impl App {
@@ -72,6 +75,7 @@ impl App {
             font_search: String::new(),
             last_applied_font: None,
             fallback_fonts,
+            toc_scroll_target: None,
         };
 
         // Apply the saved color scheme before the first frame.
@@ -396,9 +400,26 @@ impl App {
                             } else {
                                 ui.set_max_width(f32::INFINITY);
                             }
-                            let preprocessed = preprocess_decorated(&self.markdown);
-                            CommonMarkViewer::new("md_decorated")
-                                .show(ui, &mut self.md_cache, &preprocessed);
+
+                            // Split markdown at heading boundaries so each heading
+                            // can be used as a scroll target via `scroll_to_cursor`.
+                            // segments[0]   = content before the first heading (may be empty)
+                            // segments[i+1] = TOC entry i + its body content
+                            let segments = split_markdown_at_headings(&self.markdown);
+                            let scroll_target = self.toc_scroll_target.take();
+                            for (seg_idx, segment) in segments.iter().enumerate() {
+                                if seg_idx > 0 {
+                                    // seg_idx 1 → TOC entry 0, seg_idx 2 → TOC entry 1, …
+                                    if scroll_target == Some(seg_idx - 1) {
+                                        // Scroll enclosing ScrollArea so this
+                                        // heading appears at the top of the viewport.
+                                        ui.scroll_to_cursor(Some(egui::Align::TOP));
+                                    }
+                                }
+                                let preprocessed = preprocess_decorated(segment);
+                                CommonMarkViewer::new(format!("md_dec_{seg_idx}"))
+                                    .show(ui, &mut self.md_cache, &preprocessed);
+                            }
                         });
                     });
             }
@@ -472,7 +493,7 @@ impl eframe::App for App {
                     ui.strong("Contents");
                     ui.separator();
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        for entry in &toc {
+                        for (i, entry) in toc.iter().enumerate() {
                             let indent = (entry.level - 1) as f32 * 10.0;
                             ui.horizontal(|ui| {
                                 ui.add_space(indent);
@@ -483,7 +504,9 @@ impl eframe::App for App {
                                 };
                                 let text = egui::RichText::new(&entry.title).size(size);
                                 let text = if entry.level <= 2 { text.strong() } else { text };
-                                ui.label(text);
+                                if ui.add(egui::Button::new(text).frame(false)).clicked() {
+                                    self.toc_scroll_target = Some(i);
+                                }
                             });
                         }
                     });
@@ -855,6 +878,47 @@ fn extract_toc(markdown: &str) -> Vec<TocEntry> {
         }
     }
     entries
+}
+
+/// Split raw Markdown into segments at ATX heading boundaries, skipping code fences.
+///
+/// The returned `Vec` has the following layout:
+///   - `segments[0]`: any content before the first heading (may be an empty string)
+///   - `segments[i + 1]`: TOC entry `i` (the heading line itself) plus all lines
+///     until the next heading
+///
+/// This mapping lets the Decorated renderer scroll to TOC entry `i` by calling
+/// `scroll_to_cursor` right before it renders `segments[i + 1]`.
+fn split_markdown_at_headings(markdown: &str) -> Vec<String> {
+    let mut segments: Vec<String> = vec![String::new()];
+    let mut in_code = false;
+
+    for line in markdown.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_code = !in_code;
+        }
+
+        let is_heading = !in_code && {
+            let n = t.chars().take_while(|&c| c == '#').count();
+            if n >= 1 && n <= 6 {
+                let rest = &t[n..];
+                rest.is_empty() || rest.starts_with(' ')
+            } else {
+                false
+            }
+        };
+
+        if is_heading {
+            segments.push(String::new());
+        }
+
+        let last = segments.last_mut().unwrap();
+        last.push_str(line);
+        last.push('\n');
+    }
+
+    segments
 }
 
 /// Pre-process Markdown for Decorated mode.
