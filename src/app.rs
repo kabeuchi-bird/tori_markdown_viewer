@@ -42,6 +42,9 @@ pub struct App {
 
     /// TOC entry index to scroll to on the next frame (Decorated mode).
     toc_scroll_target: Option<usize>,
+    /// Cached TOC + preprocessed segments for Decorated mode.
+    /// Rebuilt lazily; set to `None` whenever `markdown` changes.
+    decorated_cache: Option<DecoratedCache>,
 }
 
 impl App {
@@ -76,6 +79,7 @@ impl App {
             last_applied_font: None,
             fallback_fonts,
             toc_scroll_target: None,
+            decorated_cache: None,
         };
 
         // Apply the saved color scheme before the first frame.
@@ -133,12 +137,11 @@ impl App {
                 }
 
                 // Update content.
-                // Strip UTF-8 BOM (\u{FEFF}) that some editors prepend; it
-                // would prevent pulldown-cmark from recognising the first `#`.
-                let content = content.strip_prefix('\u{FEFF}').map_or(content.clone(), str::to_owned);
+                let content = strip_bom(content);
                 self.source_text = content.clone();
                 self.markdown = content;
                 self.md_cache = CommonMarkCache::default();
+                self.decorated_cache = None;
                 self.settings.last_file = Some(path.to_string_lossy().into_owned());
                 self.status = path.to_string_lossy().into_owned();
                 // Update window title: "filename.md - tori markdown viewer"
@@ -158,10 +161,11 @@ impl App {
     fn reload_current(&mut self) {
         if let Some(path) = self.current_file.clone() {
             if let Ok(raw) = std::fs::read_to_string(&path) {
-                let content = raw.strip_prefix('\u{FEFF}').map_or(raw.clone(), str::to_owned);
+                let content = strip_bom(raw);
                 self.source_text = content.clone();
                 self.markdown = content;
                 self.md_cache = CommonMarkCache::default();
+                self.decorated_cache = None;
             }
         }
     }
@@ -373,6 +377,12 @@ impl App {
             }
 
             ViewMode::Decorated => {
+                if self.decorated_cache.is_none() {
+                    self.decorated_cache = Some(DecoratedCache::build(&self.markdown));
+                }
+                let num_segments = self.decorated_cache.as_ref().unwrap().segments.len();
+                let scroll_target = self.toc_scroll_target.take();
+
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -401,24 +411,15 @@ impl App {
                                 ui.set_max_width(f32::INFINITY);
                             }
 
-                            // Split markdown at heading boundaries so each heading
-                            // can be used as a scroll target via `scroll_to_cursor`.
-                            // segments[0]   = content before the first heading (may be empty)
-                            // segments[i+1] = TOC entry i + its body content
-                            let segments = split_markdown_at_headings(&self.markdown);
-                            let scroll_target = self.toc_scroll_target.take();
-                            for (seg_idx, segment) in segments.iter().enumerate() {
-                                if seg_idx > 0 {
-                                    // seg_idx 1 → TOC entry 0, seg_idx 2 → TOC entry 1, …
-                                    if scroll_target == Some(seg_idx - 1) {
-                                        // Scroll enclosing ScrollArea so this
-                                        // heading appears at the top of the viewport.
-                                        ui.scroll_to_cursor(Some(egui::Align::TOP));
-                                    }
+                            for seg_idx in 0..num_segments {
+                                // seg_idx 0 = pre-heading content (not in TOC).
+                                // seg_idx i+1 → TOC entry i.
+                                if seg_idx > 0 && scroll_target == Some(seg_idx - 1) {
+                                    ui.scroll_to_cursor(Some(egui::Align::TOP));
                                 }
-                                let preprocessed = preprocess_decorated(segment);
+                                let segment = &self.decorated_cache.as_ref().unwrap().segments[seg_idx];
                                 CommonMarkViewer::new(format!("md_dec_{seg_idx}"))
-                                    .show(ui, &mut self.md_cache, &preprocessed);
+                                    .show(ui, &mut self.md_cache, segment);
                             }
                         });
                     });
@@ -482,8 +483,16 @@ impl eframe::App for App {
         // ---- TOC sidebar (Decorated mode only, file loaded) ----
         // SidePanel must be added before CentralPanel.
         if self.settings.view_mode == ViewMode::Decorated && !self.markdown.is_empty() {
-            let toc = extract_toc(&self.markdown);
+            if self.decorated_cache.is_none() {
+                self.decorated_cache = Some(DecoratedCache::build(&self.markdown));
+            }
             let font_size = self.settings.font_size.max(8.0);
+            // Collect (level, title) pairs so the closure can freely mutate other
+            // fields of self (e.g. toc_scroll_target) without borrow conflicts.
+            let toc_items: Vec<(u8, String)> = self.decorated_cache.as_ref().unwrap()
+                .toc.iter()
+                .map(|e| (e.level, e.title.clone()))
+                .collect();
             egui::SidePanel::left("toc_panel")
                 .resizable(true)
                 .min_width(120.0)
@@ -493,17 +502,17 @@ impl eframe::App for App {
                     ui.strong("Contents");
                     ui.separator();
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        for (i, entry) in toc.iter().enumerate() {
-                            let indent = (entry.level - 1) as f32 * 10.0;
+                        for (i, (level, title)) in toc_items.iter().enumerate() {
+                            let indent = (level - 1) as f32 * 10.0;
                             ui.horizontal(|ui| {
                                 ui.add_space(indent);
-                                let size = font_size * match entry.level {
+                                let size = font_size * match level {
                                     1 => 1.0,
                                     2 => 0.9,
                                     _ => 0.82,
                                 };
-                                let text = egui::RichText::new(&entry.title).size(size);
-                                let text = if entry.level <= 2 { text.strong() } else { text };
+                                let text = egui::RichText::new(title.as_str()).size(size);
+                                let text = if *level <= 2 { text.strong() } else { text };
                                 if ui.add(egui::Button::new(text).frame(false)).clicked() {
                                     self.toc_scroll_target = Some(i);
                                 }
@@ -817,7 +826,7 @@ fn enumerate_and_collect_fonts() -> (Vec<String>, Vec<Vec<u8>>) {
 /// Use `fc-match :charset=XXXX` to find the best font covering each decoration
 /// character. Returns unique font file data not already in the priority list.
 fn collect_deco_fonts() -> Vec<Vec<u8>> {
-    // Codepoints used in H*_DECO that are absent from Ubuntu Light / Hack.
+    // Obscure decorative / symbolic codepoints often absent from common system fonts.
     const DECO_CPS: &[u32] = &[
         0x273C, // ✼  OPEN CENTRE TEARDROP-SPOKED ASTERISK
         0x2508, // ┈  BOX DRAWINGS LIGHT QUADRUPLE DASH HORIZONTAL
@@ -850,6 +859,26 @@ fn collect_deco_fonts() -> Vec<Vec<u8>> {
 struct TocEntry {
     level: u8,
     title: String,
+}
+
+/// Cached data for Decorated mode.  Built once per document; invalidated
+/// (set to `None`) whenever `App::markdown` changes.
+struct DecoratedCache {
+    toc: Vec<TocEntry>,
+    /// Preprocessed segments (H1 separator injected) ready for `CommonMarkViewer`.
+    /// `segments[0]` = content before the first heading; `segments[i+1]` = TOC entry `i`.
+    segments: Vec<String>,
+}
+
+impl DecoratedCache {
+    fn build(markdown: &str) -> Self {
+        let toc = extract_toc(markdown);
+        let segments = split_markdown_at_headings(markdown)
+            .into_iter()
+            .map(|s| preprocess_decorated(&s))
+            .collect();
+        Self { toc, segments }
+    }
 }
 
 /// Parse ATX headings from raw Markdown, skipping code fences.
@@ -897,6 +926,7 @@ fn split_markdown_at_headings(markdown: &str) -> Vec<String> {
         let t = line.trim_start();
         if t.starts_with("```") || t.starts_with("~~~") {
             in_code = !in_code;
+            // No `continue`: the fence line still belongs to the current segment.
         }
 
         let is_heading = !in_code && {
@@ -979,5 +1009,15 @@ fn load_font_from_db(db: &fontdb::Database, family_name: &str) -> Option<Vec<u8>
         let trimmed = candidate.trim_end();
         let pos = trimmed.rfind(' ')?; // no space left → family not found
         candidate = &trimmed[..pos];
+    }
+}
+
+/// Strip a UTF-8 BOM (`\u{FEFF}`) from the start of `s` if present.
+/// Some editors (e.g. Notepad) prepend a BOM that would prevent pulldown-cmark
+/// from recognising a `#` heading on the very first line.
+fn strip_bom(s: String) -> String {
+    match s.strip_prefix('\u{FEFF}') {
+        Some(stripped) => stripped.to_owned(),
+        None => s,
     }
 }
