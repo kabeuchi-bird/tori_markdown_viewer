@@ -9,6 +9,9 @@ use crate::settings::{ColorScheme, Settings, ViewMode};
 pub struct App {
     // Content
     markdown: String,
+    /// Qiita-specific syntax pre-processed version of `markdown`, used for rendering.
+    /// Source mode still shows `source_text` (the raw original).
+    preprocessed: String,
     /// Separate clone used by the read-only TextEdit in Source mode.
     source_text: String,
     current_file: Option<PathBuf>,
@@ -65,6 +68,7 @@ impl App {
 
         let mut app = Self {
             markdown: String::new(),
+            preprocessed: String::new(),
             source_text: String::new(),
             current_file: None,
             settings: settings.clone(),
@@ -139,6 +143,7 @@ impl App {
                 // Update content.
                 let content = strip_bom(content);
                 self.source_text = content.clone();
+                self.preprocessed = preprocess_qiita(&content);
                 self.markdown = content;
                 self.md_cache = CommonMarkCache::default();
                 self.decorated_cache = None;
@@ -163,6 +168,7 @@ impl App {
             if let Ok(raw) = std::fs::read_to_string(&path) {
                 let content = strip_bom(raw);
                 self.source_text = content.clone();
+                self.preprocessed = preprocess_qiita(&content);
                 self.markdown = content;
                 self.md_cache = CommonMarkCache::default();
                 self.decorated_cache = None;
@@ -372,13 +378,13 @@ impl App {
                             ui.set_max_width(f32::INFINITY);
                         }
                         CommonMarkViewer::new("md_normal")
-                            .show(ui, &mut self.md_cache, &self.markdown);
+                            .show(ui, &mut self.md_cache, &self.preprocessed);
                     });
             }
 
             ViewMode::Decorated => {
                 if self.decorated_cache.is_none() {
-                    self.decorated_cache = Some(DecoratedCache::build(&self.markdown));
+                    self.decorated_cache = Some(DecoratedCache::build(&self.preprocessed));
                 }
                 let num_segments = self.decorated_cache.as_ref().unwrap().segments.len();
                 let scroll_target = self.toc_scroll_target.take();
@@ -394,9 +400,18 @@ impl App {
                         };
                         frame.show(ui, |ui| {
                             // Wider vertical spacing between headings and body text.
+                            // Slightly reduced body text contrast (softer than the global
+                            // high-contrast setting — more pleasant for long-form reading).
                             // ui.style() is &Arc<Style>; double-deref to clone the Style.
                             let mut inner_style = (**ui.style()).clone();
                             inner_style.spacing.item_spacing.y = 8.0;
+                            let soft_color = if ui.visuals().dark_mode {
+                                egui::Color32::from_gray(220) // global=242, egui default≈200
+                            } else {
+                                egui::Color32::from_gray(35)  // global=15,  egui default≈60
+                            };
+                            inner_style.visuals.widgets.noninteractive.fg_stroke.color = soft_color;
+                            inner_style.visuals.widgets.inactive.fg_stroke.color = soft_color;
                             ui.set_style(inner_style);
 
                             if self.settings.word_wrap {
@@ -484,7 +499,7 @@ impl eframe::App for App {
         // SidePanel must be added before CentralPanel.
         if self.settings.view_mode == ViewMode::Decorated && !self.markdown.is_empty() {
             if self.decorated_cache.is_none() {
-                self.decorated_cache = Some(DecoratedCache::build(&self.markdown));
+                self.decorated_cache = Some(DecoratedCache::build(&self.preprocessed));
             }
             let font_size = self.settings.font_size.max(8.0);
             // Collect (level, title) pairs so the closure can freely mutate other
@@ -949,6 +964,121 @@ fn split_markdown_at_headings(markdown: &str) -> Vec<String> {
     }
 
     segments
+}
+
+/// Pre-process Markdown to improve rendering of Qiita-specific syntax extensions.
+///
+/// Applied to all rendered modes (Normal, Decorated) but NOT to Source mode.
+///
+/// Transformations:
+/// - `:::note TYPE` … `:::` callout blocks → blockquotes with an emoji header
+/// - ` ```lang:filename ` opening fences → filename label + plain ` ```lang ` fence
+/// - `$$` … `$$` block math → fenced code block tagged `math`
+fn preprocess_qiita(markdown: &str) -> String {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut out = String::with_capacity(markdown.len() + 256);
+    let mut i = 0;
+    let mut in_code = false;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let t = line.trim_start();
+
+        // ── Code fence (opening or closing) ─────────────────────────────────
+        let is_fence = t.starts_with("```") || t.starts_with("~~~");
+        if is_fence {
+            if !in_code {
+                // Opening fence: detect `lang:filename` syntax.
+                let fc = if t.starts_with("```") { '`' } else { '~' };
+                let fence_len = t.chars().take_while(|&c| c == fc).count();
+                let info = t[fence_len..].trim();
+                if let Some((lang, filename)) = info.split_once(':') {
+                    // Exclude URL schemes like `https://` and bare colons.
+                    if !filename.is_empty() && !filename.starts_with("//") {
+                        let fence: String = std::iter::repeat(fc).take(fence_len).collect();
+                        out.push_str(&format!("*`{filename}`*\n{fence}{lang}\n"));
+                        in_code = true;
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+            in_code = !in_code;
+            out.push_str(line);
+            out.push('\n');
+            i += 1;
+            continue;
+        }
+
+        if in_code {
+            out.push_str(line);
+            out.push('\n');
+            i += 1;
+            continue;
+        }
+
+        // ── Qiita callout blocks: :::note TYPE … ::: ────────────────────────
+        if let Some(rest) = t.strip_prefix(":::") {
+            if let Some(kind) = rest.trim().strip_prefix("note") {
+                let (emoji, label): (&str, &str) = match kind.trim().to_ascii_lowercase().as_str() {
+                    "info"             => ("ℹ️",  "Info"),
+                    "warn" | "warning" => ("⚠️",  "Warning"),
+                    "alert" | "danger" => ("🚨", "Alert"),
+                    "memo"             => ("📝", "Memo"),
+                    _                  => ("💬", "Note"),
+                };
+                out.push_str(&format!("> **{emoji} {label}**\n"));
+                i += 1;
+                let mut note_in_code = false;
+                while i < lines.len() {
+                    let bl = lines[i];
+                    let bt = bl.trim_start();
+                    // Track inner code fences so `:::` inside a code block is not treated
+                    // as the closing delimiter.
+                    if bt.starts_with("```") || bt.starts_with("~~~") {
+                        note_in_code = !note_in_code;
+                    }
+                    if !note_in_code && bt.starts_with(":::") {
+                        i += 1; // consume closing :::
+                        break;
+                    }
+                    if bl.trim().is_empty() {
+                        out.push_str(">\n");
+                    } else {
+                        out.push_str("> ");
+                        out.push_str(bl);
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        // ── Block math: $$ … $$ ─────────────────────────────────────────────
+        if t == "$$" {
+            out.push_str("```math\n");
+            i += 1;
+            while i < lines.len() {
+                let bl = lines[i];
+                if bl.trim() == "$$" {
+                    out.push_str("```\n");
+                    i += 1;
+                    break;
+                }
+                out.push_str(bl);
+                out.push('\n');
+                i += 1;
+            }
+            continue;
+        }
+
+        out.push_str(line);
+        out.push('\n');
+        i += 1;
+    }
+
+    out
 }
 
 /// Pre-process Markdown for Decorated mode.
