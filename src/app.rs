@@ -369,13 +369,17 @@ impl App {
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        // word_wrap=false: allow infinite horizontal extent so
-                        // CommonMarkViewer never wraps (available_width → ∞).
+                        // word_wrap=false: use a large but finite width so that
+                        // text does not wrap in practice, while keeping
+                        // available_width finite.  f32::INFINITY disables egui's
+                        // special main_wrap label handling, which breaks the
+                        // newline() paragraph-break mechanism and collapses all
+                        // paragraphs onto a single line.
                         // word_wrap=true: do NOT cap via set_max_width; let the
                         // scroll-area's natural available_width control wrapping
                         // so we never accidentally pass 0 on the first frame.
                         if !self.settings.word_wrap {
-                            ui.set_max_width(f32::INFINITY);
+                            ui.set_max_width(100_000.0);
                         }
                         CommonMarkViewer::new("md_normal")
                             .show(ui, &mut self.md_cache, &self.preprocessed);
@@ -423,7 +427,9 @@ impl App {
                                     ui.set_max_width(w.min(840.0));
                                 }
                             } else {
-                                ui.set_max_width(f32::INFINITY);
+                                // Same reason as Normal mode: keep available_width
+                                // finite so that paragraph breaks work correctly.
+                                ui.set_max_width(100_000.0);
                             }
 
                             for seg_idx in 0..num_segments {
