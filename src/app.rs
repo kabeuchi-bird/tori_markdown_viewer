@@ -9,6 +9,9 @@ use crate::settings::{ColorScheme, Settings, ViewMode};
 pub struct App {
     // Content
     markdown: String,
+    /// Qiita-specific syntax pre-processed version of `markdown`, used for rendering.
+    /// Source mode still shows `source_text` (the raw original).
+    preprocessed: String,
     /// Separate clone used by the read-only TextEdit in Source mode.
     source_text: String,
     current_file: Option<PathBuf>,
@@ -39,6 +42,12 @@ pub struct App {
     last_applied_font: Option<String>,
     /// System fonts loaded at startup and appended as Unicode fallbacks.
     fallback_fonts: Vec<Vec<u8>>,
+
+    /// TOC entry index to scroll to on the next frame (Decorated mode).
+    toc_scroll_target: Option<usize>,
+    /// Cached TOC + preprocessed segments for Decorated mode.
+    /// Rebuilt lazily; set to `None` whenever `markdown` changes.
+    decorated_cache: Option<DecoratedCache>,
 }
 
 impl App {
@@ -59,6 +68,7 @@ impl App {
 
         let mut app = Self {
             markdown: String::new(),
+            preprocessed: String::new(),
             source_text: String::new(),
             current_file: None,
             settings: settings.clone(),
@@ -72,6 +82,8 @@ impl App {
             font_search: String::new(),
             last_applied_font: None,
             fallback_fonts,
+            toc_scroll_target: None,
+            decorated_cache: None,
         };
 
         // Apply the saved color scheme before the first frame.
@@ -129,12 +141,12 @@ impl App {
                 }
 
                 // Update content.
-                // Strip UTF-8 BOM (\u{FEFF}) that some editors prepend; it
-                // would prevent pulldown-cmark from recognising the first `#`.
-                let content = content.strip_prefix('\u{FEFF}').map_or(content.clone(), str::to_owned);
+                let content = strip_bom(content);
                 self.source_text = content.clone();
+                self.preprocessed = preprocess_qiita(&content);
                 self.markdown = content;
                 self.md_cache = CommonMarkCache::default();
+                self.decorated_cache = None;
                 self.settings.last_file = Some(path.to_string_lossy().into_owned());
                 self.status = path.to_string_lossy().into_owned();
                 // Update window title: "filename.md - tori markdown viewer"
@@ -153,10 +165,13 @@ impl App {
 
     fn reload_current(&mut self) {
         if let Some(path) = self.current_file.clone() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                let content = strip_bom(raw);
                 self.source_text = content.clone();
+                self.preprocessed = preprocess_qiita(&content);
                 self.markdown = content;
                 self.md_cache = CommonMarkCache::default();
+                self.decorated_cache = None;
             }
         }
     }
@@ -354,15 +369,26 @@ impl App {
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        if self.settings.word_wrap {
-                            ui.set_max_width(ui.available_width());
+                        // word_wrap=false: allow infinite horizontal extent so
+                        // CommonMarkViewer never wraps (available_width → ∞).
+                        // word_wrap=true: do NOT cap via set_max_width; let the
+                        // scroll-area's natural available_width control wrapping
+                        // so we never accidentally pass 0 on the first frame.
+                        if !self.settings.word_wrap {
+                            ui.set_max_width(f32::INFINITY);
                         }
                         CommonMarkViewer::new("md_normal")
-                            .show(ui, &mut self.md_cache, &self.markdown);
+                            .show(ui, &mut self.md_cache, &self.preprocessed);
                     });
             }
 
             ViewMode::Decorated => {
+                if self.decorated_cache.is_none() {
+                    self.decorated_cache = Some(DecoratedCache::build(&self.preprocessed));
+                }
+                let num_segments = self.decorated_cache.as_ref().unwrap().segments.len();
+                let scroll_target = self.toc_scroll_target.take();
+
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -373,11 +399,43 @@ impl App {
                             ..Default::default()
                         };
                         frame.show(ui, |ui| {
+                            // Wider vertical spacing between headings and body text.
+                            // Slightly reduced body text contrast (softer than the global
+                            // high-contrast setting — more pleasant for long-form reading).
+                            // ui.style() is &Arc<Style>; double-deref to clone the Style.
+                            let mut inner_style = (**ui.style()).clone();
+                            inner_style.spacing.item_spacing.y = 8.0;
+                            let soft_color = if ui.visuals().dark_mode {
+                                egui::Color32::from_gray(220) // global=242, egui default≈200
+                            } else {
+                                egui::Color32::from_gray(35)  // global=15,  egui default≈60
+                            };
+                            inner_style.visuals.widgets.noninteractive.fg_stroke.color = soft_color;
+                            inner_style.visuals.widgets.inactive.fg_stroke.color = soft_color;
+                            ui.set_style(inner_style);
+
                             if self.settings.word_wrap {
-                                ui.set_max_width(ui.available_width().min(840.0));
+                                // Cap at 840 px for comfortable reading width.
+                                // Guard against the 0-width first frame by only
+                                // capping when the value is actually meaningful.
+                                let w = ui.available_width();
+                                if w > 0.0 {
+                                    ui.set_max_width(w.min(840.0));
+                                }
+                            } else {
+                                ui.set_max_width(f32::INFINITY);
                             }
-                            CommonMarkViewer::new("md_decorated")
-                                .show(ui, &mut self.md_cache, &self.markdown);
+
+                            for seg_idx in 0..num_segments {
+                                // seg_idx 0 = pre-heading content (not in TOC).
+                                // seg_idx i+1 → TOC entry i.
+                                if seg_idx > 0 && scroll_target == Some(seg_idx - 1) {
+                                    ui.scroll_to_cursor(Some(egui::Align::TOP));
+                                }
+                                let segment = &self.decorated_cache.as_ref().unwrap().segments[seg_idx];
+                                CommonMarkViewer::new(format!("md_dec_{seg_idx}"))
+                                    .show(ui, &mut self.md_cache, segment);
+                            }
                         });
                     });
             }
@@ -440,8 +498,16 @@ impl eframe::App for App {
         // ---- TOC sidebar (Decorated mode only, file loaded) ----
         // SidePanel must be added before CentralPanel.
         if self.settings.view_mode == ViewMode::Decorated && !self.markdown.is_empty() {
-            let toc = extract_toc(&self.markdown);
+            if self.decorated_cache.is_none() {
+                self.decorated_cache = Some(DecoratedCache::build(&self.preprocessed));
+            }
             let font_size = self.settings.font_size.max(8.0);
+            // Collect (level, title) pairs so the closure can freely mutate other
+            // fields of self (e.g. toc_scroll_target) without borrow conflicts.
+            let toc_items: Vec<(u8, String)> = self.decorated_cache.as_ref().unwrap()
+                .toc.iter()
+                .map(|e| (e.level, e.title.clone()))
+                .collect();
             egui::SidePanel::left("toc_panel")
                 .resizable(true)
                 .min_width(120.0)
@@ -451,18 +517,20 @@ impl eframe::App for App {
                     ui.strong("Contents");
                     ui.separator();
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        for entry in &toc {
-                            let indent = (entry.level - 1) as f32 * 10.0;
+                        for (i, (level, title)) in toc_items.iter().enumerate() {
+                            let indent = (level - 1) as f32 * 10.0;
                             ui.horizontal(|ui| {
                                 ui.add_space(indent);
-                                let size = font_size * match entry.level {
+                                let size = font_size * match level {
                                     1 => 1.0,
                                     2 => 0.9,
                                     _ => 0.82,
                                 };
-                                let text = egui::RichText::new(&entry.title).size(size);
-                                let text = if entry.level <= 2 { text.strong() } else { text };
-                                ui.label(text);
+                                let text = egui::RichText::new(title.as_str()).size(size);
+                                let text = if *level <= 2 { text.strong() } else { text };
+                                if ui.add(egui::Button::new(text).frame(false)).clicked() {
+                                    self.toc_scroll_target = Some(i);
+                                }
                             });
                         }
                     });
@@ -773,7 +841,7 @@ fn enumerate_and_collect_fonts() -> (Vec<String>, Vec<Vec<u8>>) {
 /// Use `fc-match :charset=XXXX` to find the best font covering each decoration
 /// character. Returns unique font file data not already in the priority list.
 fn collect_deco_fonts() -> Vec<Vec<u8>> {
-    // Codepoints used in H*_DECO that are absent from Ubuntu Light / Hack.
+    // Obscure decorative / symbolic codepoints often absent from common system fonts.
     const DECO_CPS: &[u32] = &[
         0x273C, // ✼  OPEN CENTRE TEARDROP-SPOKED ASTERISK
         0x2508, // ┈  BOX DRAWINGS LIGHT QUADRUPLE DASH HORIZONTAL
@@ -808,6 +876,26 @@ struct TocEntry {
     title: String,
 }
 
+/// Cached data for Decorated mode.  Built once per document; invalidated
+/// (set to `None`) whenever `App::markdown` changes.
+struct DecoratedCache {
+    toc: Vec<TocEntry>,
+    /// Preprocessed segments (H1 separator injected) ready for `CommonMarkViewer`.
+    /// `segments[0]` = content before the first heading; `segments[i+1]` = TOC entry `i`.
+    segments: Vec<String>,
+}
+
+impl DecoratedCache {
+    fn build(markdown: &str) -> Self {
+        let toc = extract_toc(markdown);
+        let segments = split_markdown_at_headings(markdown)
+            .into_iter()
+            .map(|s| preprocess_decorated(&s))
+            .collect();
+        Self { toc, segments }
+    }
+}
+
 /// Parse ATX headings from raw Markdown, skipping code fences.
 fn extract_toc(markdown: &str) -> Vec<TocEntry> {
     let mut entries = Vec::new();
@@ -836,6 +924,198 @@ fn extract_toc(markdown: &str) -> Vec<TocEntry> {
     entries
 }
 
+/// Split raw Markdown into segments at ATX heading boundaries, skipping code fences.
+///
+/// The returned `Vec` has the following layout:
+///   - `segments[0]`: any content before the first heading (may be an empty string)
+///   - `segments[i + 1]`: TOC entry `i` (the heading line itself) plus all lines
+///     until the next heading
+///
+/// This mapping lets the Decorated renderer scroll to TOC entry `i` by calling
+/// `scroll_to_cursor` right before it renders `segments[i + 1]`.
+fn split_markdown_at_headings(markdown: &str) -> Vec<String> {
+    let mut segments: Vec<String> = vec![String::new()];
+    let mut in_code = false;
+
+    for line in markdown.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_code = !in_code;
+            // No `continue`: the fence line still belongs to the current segment.
+        }
+
+        let is_heading = !in_code && {
+            let n = t.chars().take_while(|&c| c == '#').count();
+            if n >= 1 && n <= 6 {
+                let rest = &t[n..];
+                rest.is_empty() || rest.starts_with(' ')
+            } else {
+                false
+            }
+        };
+
+        if is_heading {
+            segments.push(String::new());
+        }
+
+        let last = segments.last_mut().unwrap();
+        last.push_str(line);
+        last.push('\n');
+    }
+
+    segments
+}
+
+/// Pre-process Markdown to improve rendering of Qiita-specific syntax extensions.
+///
+/// Applied to all rendered modes (Normal, Decorated) but NOT to Source mode.
+///
+/// Transformations:
+/// - `:::note TYPE` … `:::` callout blocks → blockquotes with an emoji header
+/// - ` ```lang:filename ` opening fences → filename label + plain ` ```lang ` fence
+/// - `$$` … `$$` block math → fenced code block tagged `math`
+fn preprocess_qiita(markdown: &str) -> String {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut out = String::with_capacity(markdown.len() + 256);
+    let mut i = 0;
+    let mut in_code = false;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let t = line.trim_start();
+
+        // ── Code fence (opening or closing) ─────────────────────────────────
+        let is_fence = t.starts_with("```") || t.starts_with("~~~");
+        if is_fence {
+            if !in_code {
+                // Opening fence: detect `lang:filename` syntax.
+                let fc = if t.starts_with("```") { '`' } else { '~' };
+                let fence_len = t.chars().take_while(|&c| c == fc).count();
+                let info = t[fence_len..].trim();
+                if let Some((lang, filename)) = info.split_once(':') {
+                    // Exclude URL schemes like `https://` and bare colons.
+                    if !filename.is_empty() && !filename.starts_with("//") {
+                        let fence: String = std::iter::repeat(fc).take(fence_len).collect();
+                        out.push_str(&format!("*`{filename}`*\n{fence}{lang}\n"));
+                        in_code = true;
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+            in_code = !in_code;
+            out.push_str(line);
+            out.push('\n');
+            i += 1;
+            continue;
+        }
+
+        if in_code {
+            out.push_str(line);
+            out.push('\n');
+            i += 1;
+            continue;
+        }
+
+        // ── Qiita callout blocks: :::note TYPE … ::: ────────────────────────
+        if let Some(rest) = t.strip_prefix(":::") {
+            if let Some(kind) = rest.trim().strip_prefix("note") {
+                let (emoji, label): (&str, &str) = match kind.trim().to_ascii_lowercase().as_str() {
+                    "info"             => ("ℹ️",  "Info"),
+                    "warn" | "warning" => ("⚠️",  "Warning"),
+                    "alert" | "danger" => ("🚨", "Alert"),
+                    "memo"             => ("📝", "Memo"),
+                    _                  => ("💬", "Note"),
+                };
+                out.push_str(&format!("> **{emoji} {label}**\n"));
+                i += 1;
+                let mut note_in_code = false;
+                while i < lines.len() {
+                    let bl = lines[i];
+                    let bt = bl.trim_start();
+                    // Track inner code fences so `:::` inside a code block is not treated
+                    // as the closing delimiter.
+                    if bt.starts_with("```") || bt.starts_with("~~~") {
+                        note_in_code = !note_in_code;
+                    }
+                    if !note_in_code && bt.starts_with(":::") {
+                        i += 1; // consume closing :::
+                        break;
+                    }
+                    if bl.trim().is_empty() {
+                        out.push_str(">\n");
+                    } else {
+                        out.push_str("> ");
+                        out.push_str(bl);
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        // ── Block math: $$ … $$ ─────────────────────────────────────────────
+        if t == "$$" {
+            out.push_str("```math\n");
+            i += 1;
+            while i < lines.len() {
+                let bl = lines[i];
+                if bl.trim() == "$$" {
+                    out.push_str("```\n");
+                    i += 1;
+                    break;
+                }
+                out.push_str(bl);
+                out.push('\n');
+                i += 1;
+            }
+            continue;
+        }
+
+        out.push_str(line);
+        out.push('\n');
+        i += 1;
+    }
+
+    out
+}
+
+/// Pre-process Markdown for Decorated mode.
+///
+/// Currently: inserts a horizontal rule (`---`) after every H1 heading so
+/// egui-commonmark renders a visible separator line below it.
+/// Code fences are left untouched.
+fn preprocess_decorated(markdown: &str) -> String {
+    let mut out = String::with_capacity(markdown.len() + 64);
+    let mut in_code = false;
+    for line in markdown.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_code = !in_code;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if in_code {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        // H1 = exactly one '#' followed by a space or end-of-line.
+        let hashes = t.chars().take_while(|&c| c == '#').count();
+        if hashes == 1 {
+            let rest = &t[1..];
+            if rest.is_empty() || rest.starts_with(' ') {
+                out.push_str("\n---\n");
+            }
+        }
+    }
+    out
+}
+
 /// Load raw font bytes for a family name.
 ///
 /// Tries an exact case-insensitive match first. If that fails, strips the
@@ -859,5 +1139,15 @@ fn load_font_from_db(db: &fontdb::Database, family_name: &str) -> Option<Vec<u8>
         let trimmed = candidate.trim_end();
         let pos = trimmed.rfind(' ')?; // no space left → family not found
         candidate = &trimmed[..pos];
+    }
+}
+
+/// Strip a UTF-8 BOM (`\u{FEFF}`) from the start of `s` if present.
+/// Some editors (e.g. Notepad) prepend a BOM that would prevent pulldown-cmark
+/// from recognising a `#` heading on the very first line.
+fn strip_bom(s: String) -> String {
+    match s.strip_prefix('\u{FEFF}') {
+        Some(stripped) => stripped.to_owned(),
+        None => s,
     }
 }
