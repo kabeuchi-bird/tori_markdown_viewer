@@ -143,7 +143,7 @@ impl App {
                 // Update content.
                 let content = strip_bom(content);
                 self.source_text = content.clone();
-                self.preprocessed = preprocess_qiita(&content);
+                self.preprocessed = preprocess_ruby(&preprocess_qiita(&content));
                 self.markdown = content;
                 self.md_cache = CommonMarkCache::default();
                 self.decorated_cache = None;
@@ -168,7 +168,7 @@ impl App {
             if let Ok(raw) = std::fs::read_to_string(&path) {
                 let content = strip_bom(raw);
                 self.source_text = content.clone();
-                self.preprocessed = preprocess_qiita(&content);
+                self.preprocessed = preprocess_ruby(&preprocess_qiita(&content));
                 self.markdown = content;
                 self.md_cache = CommonMarkCache::default();
                 self.decorated_cache = None;
@@ -972,6 +972,126 @@ fn split_markdown_at_headings(markdown: &str) -> Vec<String> {
     segments
 }
 
+/// Convert ruby (furigana) notation within a single line of plain text.
+///
+/// Supported input formats (both ASCII and full-width pipes):
+/// - Aozora Bunko:    `|漢字《ふりがな》`  /  `｜漢字《ふりがな》`
+/// - DenDen Markdown: `{漢字|ふりがな}`    /  `{漢字｜ふりがな}`
+///
+/// Both forms are normalised to `漢字《ふりがな》`.
+///
+/// Edge-case handling:
+/// - `| word` (pipe followed by a space) is left as-is (Markdown table column separator).
+/// - Incomplete patterns (no closing bracket / annotation empty) are left as-is.
+fn convert_ruby_in_line(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+
+    while i < chars.len() {
+        let ch = chars[i];
+
+        // ── Aozora Bunko: |base《annotation》or ｜base《annotation》 ──────────
+        if ch == '|' || ch == '｜' {
+            // A pipe followed by a space is a Markdown table separator — keep it.
+            if i + 1 < chars.len() && chars[i + 1] == ' ' {
+                out.push(ch);
+                i += 1;
+                continue;
+            }
+            // Scan forward to find 《 (end of base text).
+            let mut j = i + 1;
+            while j < chars.len() && chars[j] != '《' && chars[j] != '|' && chars[j] != '｜' {
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == '《' {
+                let base: String = chars[i + 1..j].iter().collect();
+                // Scan forward to find 》 (end of annotation).
+                let mut k = j + 1;
+                while k < chars.len() && chars[k] != '》' {
+                    k += 1;
+                }
+                if k < chars.len() && !base.is_empty() {
+                    let annotation: String = chars[j + 1..k].iter().collect();
+                    if !annotation.is_empty() {
+                        out.push_str(&base);
+                        out.push('《');
+                        out.push_str(&annotation);
+                        out.push('》');
+                        i = k + 1;
+                        continue;
+                    }
+                }
+            }
+            // Not a valid ruby span — emit the pipe character as-is.
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+
+        // ── DenDen Markdown: {base|annotation} or {base｜annotation} ─────────
+        if ch == '{' {
+            // Scan forward to find | or ｜ (separator between base and annotation).
+            let mut j = i + 1;
+            while j < chars.len() && chars[j] != '|' && chars[j] != '｜' && chars[j] != '}' {
+                j += 1;
+            }
+            if j < chars.len() && (chars[j] == '|' || chars[j] == '｜') {
+                let base: String = chars[i + 1..j].iter().collect();
+                // Scan forward to find } (end of annotation).
+                let mut k = j + 1;
+                while k < chars.len() && chars[k] != '}' {
+                    k += 1;
+                }
+                if k < chars.len() && !base.is_empty() {
+                    let annotation: String = chars[j + 1..k].iter().collect();
+                    if !annotation.is_empty() {
+                        out.push_str(&base);
+                        out.push('《');
+                        out.push_str(&annotation);
+                        out.push('》');
+                        i = k + 1;
+                        continue;
+                    }
+                }
+            }
+            // Not a valid ruby span — emit { as-is.
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+
+        out.push(ch);
+        i += 1;
+    }
+
+    out
+}
+
+/// Pre-process Markdown to convert ruby (furigana) notation to display format.
+///
+/// See [`convert_ruby_in_line`] for the supported input formats and output convention.
+/// Lines inside fenced code blocks (`` ``` `` / `~~~`) are left untouched.
+fn preprocess_ruby(markdown: &str) -> String {
+    let mut out = String::with_capacity(markdown.len());
+    let mut in_code = false;
+
+    for line in markdown.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_code = !in_code;
+            out.push_str(line);
+        } else if in_code {
+            out.push_str(line);
+        } else {
+            out.push_str(&convert_ruby_in_line(line));
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
 /// Pre-process Markdown to improve rendering of Qiita-specific syntax extensions.
 ///
 /// Applied to all rendered modes (Normal, Decorated) but NOT to Source mode.
@@ -1155,5 +1275,88 @@ fn strip_bom(s: String) -> String {
     match s.strip_prefix('\u{FEFF}') {
         Some(stripped) => stripped.to_owned(),
         None => s,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{convert_ruby_in_line, preprocess_ruby};
+
+    #[test]
+    fn ruby_aozora_ascii_pipe() {
+        assert_eq!(convert_ruby_in_line("|漢字《かんじ》"), "漢字《かんじ》");
+    }
+
+    #[test]
+    fn ruby_aozora_fullwidth_pipe() {
+        assert_eq!(convert_ruby_in_line("｜漢字《かんじ》"), "漢字《かんじ》");
+    }
+
+    #[test]
+    fn ruby_denden_ascii_pipe() {
+        assert_eq!(convert_ruby_in_line("{漢字|かんじ}"), "漢字《かんじ》");
+    }
+
+    #[test]
+    fn ruby_denden_fullwidth_pipe() {
+        assert_eq!(convert_ruby_in_line("{漢字｜かんじ}"), "漢字《かんじ》");
+    }
+
+    #[test]
+    fn ruby_inline_surrounding_text() {
+        assert_eq!(
+            convert_ruby_in_line("これは|漢字《かんじ》です。"),
+            "これは漢字《かんじ》です。"
+        );
+        assert_eq!(
+            convert_ruby_in_line("これは{漢字|かんじ}です。"),
+            "これは漢字《かんじ》です。"
+        );
+    }
+
+    #[test]
+    fn ruby_multiple_spans() {
+        assert_eq!(
+            convert_ruby_in_line("|東京《とうきょう》と{大阪|おおさか}"),
+            "東京《とうきょう》と大阪《おおさか》"
+        );
+    }
+
+    #[test]
+    fn ruby_table_separator_not_converted() {
+        // | followed by space → Markdown table separator, leave as-is
+        assert_eq!(convert_ruby_in_line("| col1 | col2 |"), "| col1 | col2 |");
+    }
+
+    #[test]
+    fn ruby_incomplete_aozora_no_kakko() {
+        // No 《 found → emit pipe as-is
+        assert_eq!(convert_ruby_in_line("|漢字"), "|漢字");
+    }
+
+    #[test]
+    fn ruby_incomplete_denden_no_closing_brace() {
+        // No closing } → emit { as-is
+        assert_eq!(convert_ruby_in_line("{漢字|かんじ"), "{漢字|かんじ");
+    }
+
+    #[test]
+    fn ruby_code_block_untouched() {
+        let input = "```\n|漢字《かんじ》\n{漢字|かんじ}\n```\n";
+        let output = preprocess_ruby(input);
+        assert!(output.contains("|漢字《かんじ》"));
+        assert!(output.contains("{漢字|かんじ}"));
+    }
+
+    #[test]
+    fn ruby_outside_code_block_converted() {
+        let input = "|漢字《かんじ》\n```\n|漢字《かんじ》\n```\n|漢字《かんじ》\n";
+        let output = preprocess_ruby(input);
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines[0], "漢字《かんじ》");      // converted
+        assert_eq!(lines[1], "```");
+        assert_eq!(lines[2], "|漢字《かんじ》");     // inside code fence — untouched
+        assert_eq!(lines[3], "```");
+        assert_eq!(lines[4], "漢字《かんじ》");      // converted
     }
 }
