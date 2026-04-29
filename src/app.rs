@@ -522,7 +522,7 @@ impl eframe::App for App {
                     ui.add_space(6.0);
                     ui.strong("Contents");
                     ui.separator();
-                    egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::ScrollArea::both().show(ui, |ui| {
                         for (i, (level, title)) in toc_items.iter().enumerate() {
                             let indent = (level - 1) as f32 * 10.0;
                             ui.horizontal(|ui| {
