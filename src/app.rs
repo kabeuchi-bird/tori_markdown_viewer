@@ -4,6 +4,12 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use notify::{EventKind, RecursiveMode, Watcher};
 
+// f32::INFINITY breaks egui's special main_wrap label handling, causing
+// newline() to lose its paragraph-break effect (all paragraphs collapse to
+// one line).  Any large finite value avoids this; 100 000 px ≈ 26× a 4K
+// monitor width, so no practical line of text will ever trigger wrapping.
+const NO_WRAP_MAX_WIDTH: f32 = 100_000.0;
+
 use crate::settings::{ColorScheme, Settings, ViewMode};
 
 pub struct App {
@@ -369,17 +375,11 @@ impl App {
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        // word_wrap=false: use a large but finite width so that
-                        // text does not wrap in practice, while keeping
-                        // available_width finite.  f32::INFINITY disables egui's
-                        // special main_wrap label handling, which breaks the
-                        // newline() paragraph-break mechanism and collapses all
-                        // paragraphs onto a single line.
                         // word_wrap=true: do NOT cap via set_max_width; let the
                         // scroll-area's natural available_width control wrapping
                         // so we never accidentally pass 0 on the first frame.
                         if !self.settings.word_wrap {
-                            ui.set_max_width(100_000.0);
+                            ui.set_max_width(NO_WRAP_MAX_WIDTH);
                         }
                         CommonMarkViewer::new("md_normal")
                             .show(ui, &mut self.md_cache, &self.preprocessed);
@@ -427,9 +427,7 @@ impl App {
                                     ui.set_max_width(w.min(840.0));
                                 }
                             } else {
-                                // Same reason as Normal mode: keep available_width
-                                // finite so that paragraph breaks work correctly.
-                                ui.set_max_width(100_000.0);
+                                ui.set_max_width(NO_WRAP_MAX_WIDTH);
                             }
 
                             for seg_idx in 0..num_segments {
@@ -522,7 +520,7 @@ impl eframe::App for App {
                     ui.add_space(6.0);
                     ui.strong("Contents");
                     ui.separator();
-                    egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::ScrollArea::both().show(ui, |ui| {
                         for (i, (level, title)) in toc_items.iter().enumerate() {
                             let indent = (level - 1) as f32 * 10.0;
                             ui.horizontal(|ui| {

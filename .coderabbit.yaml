@@ -1,0 +1,55 @@
+language: "ja-JP"
+
+early_access: false
+
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  high_level_summary_placeholder: "@coderabbitai summary"
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+      - master
+
+  path_filters:
+    - "!Cargo.lock"
+    - "!target/**"
+    - "!assets/**"
+    - "**/*.rs"
+    - "**/*.toml"
+    - "**/*.yml"
+    - "**/*.yaml"
+    - "**/*.md"
+
+  path_instructions:
+    - path: "src/app.rs"
+      instructions: |
+        - egui/eframe 0.28 の即時モード GUI パターンに沿っているか確認してください。
+        - `ui.set_max_width(f32::INFINITY)` は段落区切りを破壊するため使用禁止です。
+          代わりに定数 `NO_WRAP_MAX_WIDTH`（100_000.0）を使用してください。
+        - `unsafe` ブロックがないことを確認してください。
+        - `clone()` の過剰使用がないか確認してください（egui の即時モードでは借用で十分なことが多い）。
+        - `ScrollArea` の使用箇所では、横スクロールが必要な場合は `both()` を、
+          縦のみで良い場合は `vertical()` を使っているか確認してください。
+        - `serde` のシリアライゼーション対象（`Settings` など）に追加フィールドを
+          加えるときは `#[serde(default)]` を付けてください（後方互換性のため）。
+
+    - path: "Cargo.toml"
+      instructions: |
+        - `eframe` / `egui` / `egui_commonmark` のバージョンを揃えてください。
+        - 不要な features を有効化していないか確認してください。
+        - `[patch.crates-io]` を追加する場合はコメントで理由を記載してください。
+
+    - path: ".github/workflows/**"
+      instructions: |
+        - `ubuntu-latest` などランナーのバージョンが固定されているか確認してください。
+        - `cargo clippy` と `cargo fmt --check` が CI で実行されているか確認してください。
+
+chat:
+  auto_reply: true
