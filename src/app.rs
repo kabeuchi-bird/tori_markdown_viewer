@@ -492,17 +492,19 @@ impl eframe::App for App {
             self.apply_font(ctx);
         }
 
-        // ---- Ctrl+scroll: font size ----
-        // Consume the vertical scroll so the content area doesn't also scroll.
-        let scroll_y = ctx.input_mut(|i| {
-            if i.modifiers.command {
+        // ---- Keyboard shortcuts and Ctrl+scroll ----
+        // input_mut consumes the scroll so the content area doesn't also scroll.
+        let (scroll_y, keyboard_open) = ctx.input_mut(|i| {
+            let scroll_y = if i.modifiers.command {
                 let dy = i.smooth_scroll_delta.y;
                 i.smooth_scroll_delta.y = 0.0;
-                i.raw_scroll_delta.y   = 0.0;
+                i.raw_scroll_delta.y = 0.0;
                 dy
             } else {
                 0.0
-            }
+            };
+            let keyboard_open = i.key_pressed(egui::Key::O) && i.modifiers.command;
+            (scroll_y, keyboard_open)
         });
         if scroll_y != 0.0 {
             self.settings.font_size = (self.settings.font_size + scroll_y * 0.1).clamp(8.0, 72.0);
@@ -564,8 +566,6 @@ impl eframe::App for App {
         if let Some(path) = dropped {
             self.open_file(path, ctx);
         }
-
-        let keyboard_open = ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command);
 
         if open_requested || keyboard_open || self.open_dialog {
             self.open_dialog = false;
@@ -875,14 +875,27 @@ impl DecoratedCache {
     }
 }
 
+/// Return the ATX heading level (1–6) if `line` is a valid ATX heading, else `None`.
+fn atx_heading_level(line: &str) -> Option<u8> {
+    let t = line.trim_start();
+    let n = t.chars().take_while(|&c| c == '#').count();
+    if n >= 1 && n <= 6 {
+        let rest = &t[n..];
+        if rest.is_empty() || rest.starts_with(' ') {
+            return Some(n as u8);
+        }
+    }
+    None
+}
+
 /// Return the setext heading level if `line` is a valid setext underline:
 /// all `=` chars → `Some(1)`, all `-` chars → `Some(2)`, otherwise `None`.
 fn setext_underline_level(line: &str) -> Option<u8> {
     let t = line.trim();
-    if t.is_empty() { return None; }
-    if t.chars().all(|c| c == '=') { Some(1) }
-    else if t.chars().all(|c| c == '-') { Some(2) }
-    else { None }
+    let mut chars = t.chars();
+    let first = chars.next()?;
+    let level = match first { '=' => 1u8, '-' => 2u8, _ => return None };
+    if chars.all(|c| c == first) { Some(level) } else { None }
 }
 
 /// Parse ATX and setext headings from raw Markdown, skipping code fences.
@@ -903,19 +916,16 @@ fn extract_toc(markdown: &str) -> Vec<TocEntry> {
         if in_code { i += 1; continue; }
 
         // ATX heading
-        let level = t.chars().take_while(|&c| c == '#').count();
-        if level >= 1 && level <= 6 {
-            let rest = &t[level..];
-            if rest.starts_with(' ') {
-                let title = rest[1..].trim_end_matches(|c: char| c == '#' || c == ' ').to_owned();
-                entries.push(TocEntry { level: level as u8, title });
-                i += 1;
-                continue;
-            } else if rest.is_empty() {
-                entries.push(TocEntry { level: level as u8, title: String::new() });
-                i += 1;
-                continue;
-            }
+        if let Some(level) = atx_heading_level(lines[i]) {
+            let rest = &t[level as usize..];
+            let title = if rest.is_empty() {
+                String::new()
+            } else {
+                rest[1..].trim_end_matches(|c: char| c == '#' || c == ' ').to_owned()
+            };
+            entries.push(TocEntry { level, title });
+            i += 1;
+            continue;
         }
 
         // Setext heading: non-blank text line followed by === (H1) or --- (H2)
@@ -957,15 +967,7 @@ fn split_markdown_at_headings(markdown: &str) -> Vec<String> {
             // No `continue`: the fence line still belongs to the current segment.
         }
 
-        let is_atx = !in_code && {
-            let n = t.chars().take_while(|&c| c == '#').count();
-            if n >= 1 && n <= 6 {
-                let rest = &t[n..];
-                rest.is_empty() || rest.starts_with(' ')
-            } else {
-                false
-            }
-        };
+        let is_atx = !in_code && atx_heading_level(line).is_some();
 
         // Setext: non-blank, non-fence line followed by === or ---
         let setext_level = if !in_code && !t.is_empty()
@@ -1145,15 +1147,10 @@ fn preprocess_decorated(markdown: &str) -> String {
         out.push_str(line);
         out.push('\n');
 
-        // ATX H1: exactly one '#' followed by a space or end-of-line.
-        let hashes = t.chars().take_while(|&c| c == '#').count();
-        if hashes == 1 {
-            let rest = &t[1..];
-            if rest.is_empty() || rest.starts_with(' ') {
-                out.push_str("\n---\n");
-                i += 1;
-                continue;
-            }
+        if atx_heading_level(line) == Some(1) {
+            out.push_str("\n---\n");
+            i += 1;
+            continue;
         }
 
         // Setext heading: non-blank text line followed by === (H1) or --- (H2).
