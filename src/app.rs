@@ -14,12 +14,10 @@ use crate::settings::{ColorScheme, Settings, ViewMode};
 
 pub struct App {
     // Content
+    /// Raw source text shown in Source mode and used for the empty-state check.
     markdown: String,
     /// Qiita-specific syntax pre-processed version of `markdown`, used for rendering.
-    /// Source mode still shows `source_text` (the raw original).
     preprocessed: String,
-    /// Separate clone used by the read-only TextEdit in Source mode.
-    source_text: String,
     current_file: Option<PathBuf>,
 
     // Settings (persisted via eframe::Storage)
@@ -48,6 +46,8 @@ pub struct App {
     last_applied_font: Option<String>,
     /// System fonts loaded at startup and appended as Unicode fallbacks.
     fallback_fonts: Vec<Vec<u8>>,
+    /// fontdb database built once at startup; reused by apply_font to avoid re-scanning.
+    font_db: fontdb::Database,
 
     /// TOC entry index to scroll to on the next frame (Decorated mode).
     toc_scroll_target: Option<usize>,
@@ -67,15 +67,14 @@ impl App {
         // (on first file open) so we can capture the egui Context.
         let (_tx_placeholder, rx) = mpsc::sync_channel::<()>(0);
 
-        // Enumerate system fonts once at startup (shared DB avoids rebuilding twice).
-        let (font_families, fallback_fonts) = enumerate_and_collect_fonts();
+        // Enumerate system fonts once at startup; keep the DB to avoid re-scanning later.
+        let (font_db, font_families, fallback_fonts) = enumerate_and_collect_fonts();
         // Font detection chain: DE setting → fontconfig → None (egui built-ins).
         let system_default_font = detect_de_font().or_else(detect_system_default_font);
 
         let mut app = Self {
             markdown: String::new(),
             preprocessed: String::new(),
-            source_text: String::new(),
             current_file: None,
             settings: settings.clone(),
             watcher: None,
@@ -88,6 +87,7 @@ impl App {
             font_search: String::new(),
             last_applied_font: None,
             fallback_fonts,
+            font_db,
             toc_scroll_target: None,
             decorated_cache: None,
         };
@@ -148,7 +148,6 @@ impl App {
 
                 // Update content.
                 let content = strip_bom(content);
-                self.source_text = content.clone();
                 self.preprocessed = preprocess_qiita(&content);
                 self.markdown = content;
                 self.md_cache = CommonMarkCache::default();
@@ -173,7 +172,6 @@ impl App {
         if let Some(path) = self.current_file.clone() {
             if let Ok(raw) = std::fs::read_to_string(&path) {
                 let content = strip_bom(raw);
-                self.source_text = content.clone();
                 self.preprocessed = preprocess_qiita(&content);
                 self.markdown = content;
                 self.md_cache = CommonMarkCache::default();
@@ -228,7 +226,7 @@ impl App {
         let mut fonts = egui::FontDefinitions::default();
 
         // --- Primary font (prepended → highest priority) ---
-        if let Some(data) = family_to_load.and_then(|n| load_font_data(n)) {
+        if let Some(data) = family_to_load.and_then(|n| load_font_from_db(&self.font_db, n)) {
             let key = "user_font".to_owned();
             fonts.font_data.insert(key.clone(), egui::FontData::from_owned(data).into());
             fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, key.clone());
@@ -454,7 +452,7 @@ impl App {
                             f32::INFINITY
                         };
                         ui.add(
-                            egui::TextEdit::multiline(&mut self.source_text)
+                            egui::TextEdit::multiline(&mut self.markdown)
                                 .font(egui::TextStyle::Monospace)
                                 .desired_width(desired_width)
                                 .interactive(false),
@@ -492,6 +490,24 @@ impl eframe::App for App {
         }
         if font_changed {
             self.apply_font(ctx);
+        }
+
+        // ---- Keyboard shortcuts and Ctrl+scroll ----
+        // input_mut consumes the scroll so the content area doesn't also scroll.
+        let (scroll_y, keyboard_open) = ctx.input_mut(|i| {
+            let scroll_y = if i.modifiers.command {
+                let dy = i.smooth_scroll_delta.y;
+                i.smooth_scroll_delta.y = 0.0;
+                i.raw_scroll_delta.y = 0.0;
+                dy
+            } else {
+                0.0
+            };
+            let keyboard_open = i.key_pressed(egui::Key::O) && i.modifiers.command;
+            (scroll_y, keyboard_open)
+        });
+        if scroll_y != 0.0 {
+            self.settings.font_size = (self.settings.font_size + scroll_y * 0.1).clamp(8.0, 72.0);
         }
 
         // ---- Status bar ----
@@ -551,7 +567,7 @@ impl eframe::App for App {
             self.open_file(path, ctx);
         }
 
-        if open_requested || self.open_dialog {
+        if open_requested || keyboard_open || self.open_dialog {
             self.open_dialog = false;
             let start_dir = self
                 .current_file
@@ -783,9 +799,10 @@ fn detect_system_default_font() -> Option<String> {
 }
 
 /// Build the fontdb once and return:
+///   - the database itself (kept alive in App for later font lookups)
 ///   - sorted list of all family names (for the font picker ComboBox)
 ///   - raw font data for Unicode fallback fonts (in priority order)
-fn enumerate_and_collect_fonts() -> (Vec<String>, Vec<Vec<u8>>) {
+fn enumerate_and_collect_fonts() -> (fontdb::Database, Vec<String>, Vec<Vec<u8>>) {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
 
@@ -825,53 +842,11 @@ fn enumerate_and_collect_fonts() -> (Vec<String>, Vec<Vec<u8>>) {
                 fallbacks.push(data);
             }
         }
-        if fallbacks.len() >= 6 {
-            break;
-        }
     }
 
-    // Additionally, ask fontconfig which fonts cover each decoration character.
-    // This guarantees display even when none of the priority fonts are installed.
-    for data in collect_deco_fonts() {
-        if fallbacks.len() >= 10 {
-            break;
-        }
-        fallbacks.push(data);
-    }
-
-    (families, fallbacks)
+    (db, families, fallbacks)
 }
 
-/// Use `fc-match :charset=XXXX` to find the best font covering each decoration
-/// character. Returns unique font file data not already in the priority list.
-fn collect_deco_fonts() -> Vec<Vec<u8>> {
-    // Obscure decorative / symbolic codepoints often absent from common system fonts.
-    const DECO_CPS: &[u32] = &[
-        0x273C, // ✼  OPEN CENTRE TEARDROP-SPOKED ASTERISK
-        0x2508, // ┈  BOX DRAWINGS LIGHT QUADRUPLE DASH HORIZONTAL
-        0x2726, // ✦  BLACK FOUR POINTED STAR
-        0x273B, // ✻  TEARDROP-SPOKED ASTERISK
-        0x2724, // ✤  HEAVY FOUR BALLOON-SPOKED ASTERISK
-        0x2767, // ❧  ROTATED FLORAL HEART BULLET
-        0x273F, // ✿  BLACK FLORETTE
-    ];
-
-    let mut seen: std::collections::HashSet<String> = Default::default();
-    let mut result: Vec<Vec<u8>> = Vec::new();
-
-    for &cp in DECO_CPS {
-        let pattern = format!(":charset={cp:X}");
-        if let Some(path) = run_command("fc-match", &["--format=%{file}", &pattern]) {
-            if seen.insert(path.clone()) {
-                if let Ok(data) = std::fs::read(&path) {
-                    result.push(data);
-                }
-            }
-        }
-    }
-
-    result
-}
 
 // ------------------------------------------------------------------ TOC helpers
 
@@ -900,71 +875,126 @@ impl DecoratedCache {
     }
 }
 
-/// Parse ATX headings from raw Markdown, skipping code fences.
+/// Return the ATX heading level (1–6) if `line` is a valid ATX heading, else `None`.
+fn atx_heading_level(line: &str) -> Option<u8> {
+    let t = line.trim_start();
+    let n = t.chars().take_while(|&c| c == '#').count();
+    if n >= 1 && n <= 6 {
+        let rest = &t[n..];
+        if rest.is_empty() || rest.starts_with(' ') {
+            return Some(n as u8);
+        }
+    }
+    None
+}
+
+/// Return the setext heading level if `line` is a valid setext underline:
+/// all `=` chars → `Some(1)`, all `-` chars → `Some(2)`, otherwise `None`.
+fn setext_underline_level(line: &str) -> Option<u8> {
+    let t = line.trim();
+    let mut chars = t.chars();
+    let first = chars.next()?;
+    let level = match first { '=' => 1u8, '-' => 2u8, _ => return None };
+    if chars.all(|c| c == first) { Some(level) } else { None }
+}
+
+/// Parse ATX and setext headings from raw Markdown, skipping code fences.
 fn extract_toc(markdown: &str) -> Vec<TocEntry> {
+    let lines: Vec<&str> = markdown.lines().collect();
     let mut entries = Vec::new();
     let mut in_code = false;
-    for line in markdown.lines() {
-        let t = line.trim_start();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let t = lines[i].trim_start();
+
         if t.starts_with("```") || t.starts_with("~~~") {
             in_code = !in_code;
+            i += 1;
             continue;
         }
-        if in_code {
+        if in_code { i += 1; continue; }
+
+        // ATX heading
+        if let Some(level) = atx_heading_level(lines[i]) {
+            let rest = &t[level as usize..];
+            let title = if rest.is_empty() {
+                String::new()
+            } else {
+                rest[1..].trim_end_matches(|c: char| c == '#' || c == ' ').to_owned()
+            };
+            entries.push(TocEntry { level, title });
+            i += 1;
             continue;
         }
-        let level = t.chars().take_while(|&c| c == '#').count();
-        if level == 0 || level > 6 {
-            continue;
+
+        // Setext heading: non-blank text line followed by === (H1) or --- (H2)
+        if !t.is_empty() {
+            if let Some(level) = lines.get(i + 1).copied().and_then(setext_underline_level) {
+                entries.push(TocEntry { level, title: t.trim().to_owned() });
+                i += 2;
+                continue;
+            }
         }
-        let rest = &t[level..];
-        if rest.starts_with(' ') {
-            let title = rest[1..].trim_end_matches(|c: char| c == '#' || c == ' ');
-            entries.push(TocEntry { level: level as u8, title: title.to_owned() });
-        } else if rest.is_empty() {
-            entries.push(TocEntry { level: level as u8, title: String::new() });
-        }
+
+        i += 1;
     }
     entries
 }
 
-/// Split raw Markdown into segments at ATX heading boundaries, skipping code fences.
+/// Split raw Markdown into segments at heading boundaries (ATX and setext),
+/// skipping code fences.
 ///
 /// The returned `Vec` has the following layout:
 ///   - `segments[0]`: any content before the first heading (may be an empty string)
-///   - `segments[i + 1]`: TOC entry `i` (the heading line itself) plus all lines
-///     until the next heading
+///   - `segments[i + 1]`: TOC entry `i` (the heading line(s) themselves) plus all
+///     lines until the next heading
 ///
 /// This mapping lets the Decorated renderer scroll to TOC entry `i` by calling
 /// `scroll_to_cursor` right before it renders `segments[i + 1]`.
 fn split_markdown_at_headings(markdown: &str) -> Vec<String> {
+    let lines: Vec<&str> = markdown.lines().collect();
     let mut segments: Vec<String> = vec![String::new()];
     let mut in_code = false;
+    let mut i = 0;
 
-    for line in markdown.lines() {
+    while i < lines.len() {
+        let line = lines[i];
         let t = line.trim_start();
+
         if t.starts_with("```") || t.starts_with("~~~") {
             in_code = !in_code;
             // No `continue`: the fence line still belongs to the current segment.
         }
 
-        let is_heading = !in_code && {
-            let n = t.chars().take_while(|&c| c == '#').count();
-            if n >= 1 && n <= 6 {
-                let rest = &t[n..];
-                rest.is_empty() || rest.starts_with(' ')
-            } else {
-                false
-            }
+        let is_atx = !in_code && atx_heading_level(line).is_some();
+
+        // Setext: non-blank, non-fence line followed by === or ---
+        let setext_level = if !in_code && !t.is_empty()
+            && !(t.starts_with("```") || t.starts_with("~~~"))
+        {
+            lines.get(i + 1).copied().and_then(setext_underline_level)
+        } else {
+            None
         };
 
-        if is_heading {
+        if is_atx || setext_level.is_some() {
             segments.push(String::new());
         }
 
         let last = segments.last_mut().unwrap();
         last.push_str(line);
         last.push('\n');
+
+        if setext_level.is_some() {
+            // Consume the underline into the same segment.
+            last.push_str(lines[i + 1]);
+            last.push('\n');
+            i += 2;
+            continue;
+        }
+
+        i += 1;
     }
 
     segments
@@ -1087,48 +1117,58 @@ fn preprocess_qiita(markdown: &str) -> String {
 
 /// Pre-process Markdown for Decorated mode.
 ///
-/// Currently: inserts a horizontal rule (`---`) after every H1 heading so
-/// egui-commonmark renders a visible separator line below it.
+/// Inserts a horizontal rule (`---`) after every H1 heading (ATX and setext)
+/// so egui-commonmark renders a visible separator line below it.
 /// Code fences are left untouched.
 fn preprocess_decorated(markdown: &str) -> String {
+    let lines: Vec<&str> = markdown.lines().collect();
     let mut out = String::with_capacity(markdown.len() + 64);
     let mut in_code = false;
-    for line in markdown.lines() {
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
         let t = line.trim_start();
+
         if t.starts_with("```") || t.starts_with("~~~") {
             in_code = !in_code;
             out.push_str(line);
             out.push('\n');
+            i += 1;
             continue;
         }
         if in_code {
             out.push_str(line);
             out.push('\n');
+            i += 1;
             continue;
         }
+
         out.push_str(line);
         out.push('\n');
-        // H1 = exactly one '#' followed by a space or end-of-line.
-        let hashes = t.chars().take_while(|&c| c == '#').count();
-        if hashes == 1 {
-            let rest = &t[1..];
-            if rest.is_empty() || rest.starts_with(' ') {
-                out.push_str("\n---\n");
+
+        if atx_heading_level(line) == Some(1) {
+            out.push_str("\n---\n");
+            i += 1;
+            continue;
+        }
+
+        // Setext heading: non-blank text line followed by === (H1) or --- (H2).
+        if !t.is_empty() {
+            if let Some(level) = lines.get(i + 1).copied().and_then(setext_underline_level) {
+                out.push_str(lines[i + 1]);
+                out.push('\n');
+                if level == 1 {
+                    out.push_str("\n---\n");
+                }
+                i += 2;
+                continue;
             }
         }
+
+        i += 1;
     }
     out
-}
-
-/// Load raw font bytes for a family name.
-///
-/// Tries an exact case-insensitive match first. If that fails, strips the
-/// trailing word and retries — this handles DE font strings like
-/// `"Noto Sans DemiLight"` where fontdb stores the family as `"Noto Sans"`.
-fn load_font_data(family_name: &str) -> Option<Vec<u8>> {
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
-    load_font_from_db(&db, family_name)
 }
 
 fn load_font_from_db(db: &fontdb::Database, family_name: &str) -> Option<Vec<u8>> {
