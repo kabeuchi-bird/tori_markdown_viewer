@@ -551,7 +551,9 @@ impl eframe::App for App {
             self.open_file(path, ctx);
         }
 
-        if open_requested || self.open_dialog {
+        let keyboard_open = ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command);
+
+        if open_requested || keyboard_open || self.open_dialog {
             self.open_dialog = false;
             let start_dir = self
                 .current_file
