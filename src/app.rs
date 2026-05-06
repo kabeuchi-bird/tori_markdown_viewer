@@ -842,53 +842,11 @@ fn enumerate_and_collect_fonts() -> (fontdb::Database, Vec<String>, Vec<Vec<u8>>
                 fallbacks.push(data);
             }
         }
-        if fallbacks.len() >= 6 {
-            break;
-        }
-    }
-
-    // Additionally, ask fontconfig which fonts cover each decoration character.
-    // This guarantees display even when none of the priority fonts are installed.
-    for data in collect_deco_fonts() {
-        if fallbacks.len() >= 10 {
-            break;
-        }
-        fallbacks.push(data);
     }
 
     (db, families, fallbacks)
 }
 
-/// Use `fc-match :charset=XXXX` to find the best font covering each decoration
-/// character. Returns unique font file data not already in the priority list.
-fn collect_deco_fonts() -> Vec<Vec<u8>> {
-    // Obscure decorative / symbolic codepoints often absent from common system fonts.
-    const DECO_CPS: &[u32] = &[
-        0x273C, // ✼  OPEN CENTRE TEARDROP-SPOKED ASTERISK
-        0x2508, // ┈  BOX DRAWINGS LIGHT QUADRUPLE DASH HORIZONTAL
-        0x2726, // ✦  BLACK FOUR POINTED STAR
-        0x273B, // ✻  TEARDROP-SPOKED ASTERISK
-        0x2724, // ✤  HEAVY FOUR BALLOON-SPOKED ASTERISK
-        0x2767, // ❧  ROTATED FLORAL HEART BULLET
-        0x273F, // ✿  BLACK FLORETTE
-    ];
-
-    let mut seen: std::collections::HashSet<String> = Default::default();
-    let mut result: Vec<Vec<u8>> = Vec::new();
-
-    for &cp in DECO_CPS {
-        let pattern = format!(":charset={cp:X}");
-        if let Some(path) = run_command("fc-match", &["--format=%{file}", &pattern]) {
-            if seen.insert(path.clone()) {
-                if let Ok(data) = std::fs::read(&path) {
-                    result.push(data);
-                }
-            }
-        }
-    }
-
-    result
-}
 
 // ------------------------------------------------------------------ TOC helpers
 
