@@ -14,12 +14,10 @@ use crate::settings::{ColorScheme, Settings, ViewMode};
 
 pub struct App {
     // Content
+    /// Raw source text shown in Source mode and used for the empty-state check.
     markdown: String,
     /// Qiita-specific syntax pre-processed version of `markdown`, used for rendering.
-    /// Source mode still shows `source_text` (the raw original).
     preprocessed: String,
-    /// Separate clone used by the read-only TextEdit in Source mode.
-    source_text: String,
     current_file: Option<PathBuf>,
 
     // Settings (persisted via eframe::Storage)
@@ -77,7 +75,6 @@ impl App {
         let mut app = Self {
             markdown: String::new(),
             preprocessed: String::new(),
-            source_text: String::new(),
             current_file: None,
             settings: settings.clone(),
             watcher: None,
@@ -151,7 +148,6 @@ impl App {
 
                 // Update content.
                 let content = strip_bom(content);
-                self.source_text = content.clone();
                 self.preprocessed = preprocess_qiita(&content);
                 self.markdown = content;
                 self.md_cache = CommonMarkCache::default();
@@ -176,7 +172,6 @@ impl App {
         if let Some(path) = self.current_file.clone() {
             if let Ok(raw) = std::fs::read_to_string(&path) {
                 let content = strip_bom(raw);
-                self.source_text = content.clone();
                 self.preprocessed = preprocess_qiita(&content);
                 self.markdown = content;
                 self.md_cache = CommonMarkCache::default();
@@ -457,7 +452,7 @@ impl App {
                             f32::INFINITY
                         };
                         ui.add(
-                            egui::TextEdit::multiline(&mut self.source_text)
+                            egui::TextEdit::multiline(&mut self.markdown)
                                 .font(egui::TextStyle::Monospace)
                                 .desired_width(desired_width)
                                 .interactive(false),
