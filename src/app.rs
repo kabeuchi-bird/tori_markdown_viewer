@@ -48,6 +48,8 @@ pub struct App {
     last_applied_font: Option<String>,
     /// System fonts loaded at startup and appended as Unicode fallbacks.
     fallback_fonts: Vec<Vec<u8>>,
+    /// fontdb database built once at startup; reused by apply_font to avoid re-scanning.
+    font_db: fontdb::Database,
 
     /// TOC entry index to scroll to on the next frame (Decorated mode).
     toc_scroll_target: Option<usize>,
@@ -67,8 +69,8 @@ impl App {
         // (on first file open) so we can capture the egui Context.
         let (_tx_placeholder, rx) = mpsc::sync_channel::<()>(0);
 
-        // Enumerate system fonts once at startup (shared DB avoids rebuilding twice).
-        let (font_families, fallback_fonts) = enumerate_and_collect_fonts();
+        // Enumerate system fonts once at startup; keep the DB to avoid re-scanning later.
+        let (font_db, font_families, fallback_fonts) = enumerate_and_collect_fonts();
         // Font detection chain: DE setting → fontconfig → None (egui built-ins).
         let system_default_font = detect_de_font().or_else(detect_system_default_font);
 
@@ -88,6 +90,7 @@ impl App {
             font_search: String::new(),
             last_applied_font: None,
             fallback_fonts,
+            font_db,
             toc_scroll_target: None,
             decorated_cache: None,
         };
@@ -228,7 +231,7 @@ impl App {
         let mut fonts = egui::FontDefinitions::default();
 
         // --- Primary font (prepended → highest priority) ---
-        if let Some(data) = family_to_load.and_then(|n| load_font_data(n)) {
+        if let Some(data) = family_to_load.and_then(|n| load_font_from_db(&self.font_db, n)) {
             let key = "user_font".to_owned();
             fonts.font_data.insert(key.clone(), egui::FontData::from_owned(data).into());
             fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, key.clone());
@@ -785,9 +788,10 @@ fn detect_system_default_font() -> Option<String> {
 }
 
 /// Build the fontdb once and return:
+///   - the database itself (kept alive in App for later font lookups)
 ///   - sorted list of all family names (for the font picker ComboBox)
 ///   - raw font data for Unicode fallback fonts (in priority order)
-fn enumerate_and_collect_fonts() -> (Vec<String>, Vec<Vec<u8>>) {
+fn enumerate_and_collect_fonts() -> (fontdb::Database, Vec<String>, Vec<Vec<u8>>) {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
 
@@ -841,7 +845,7 @@ fn enumerate_and_collect_fonts() -> (Vec<String>, Vec<Vec<u8>>) {
         fallbacks.push(data);
     }
 
-    (families, fallbacks)
+    (db, families, fallbacks)
 }
 
 /// Use `fc-match :charset=XXXX` to find the best font covering each decoration
@@ -1120,17 +1124,6 @@ fn preprocess_decorated(markdown: &str) -> String {
         }
     }
     out
-}
-
-/// Load raw font bytes for a family name.
-///
-/// Tries an exact case-insensitive match first. If that fails, strips the
-/// trailing word and retries — this handles DE font strings like
-/// `"Noto Sans DemiLight"` where fontdb stores the family as `"Noto Sans"`.
-fn load_font_data(family_name: &str) -> Option<Vec<u8>> {
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
-    load_font_from_db(&db, family_name)
 }
 
 fn load_font_from_db(db: &fontdb::Database, family_name: &str) -> Option<Vec<u8>> {
