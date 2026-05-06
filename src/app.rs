@@ -917,55 +917,89 @@ impl DecoratedCache {
     }
 }
 
-/// Parse ATX headings from raw Markdown, skipping code fences.
+/// Return the setext heading level if `line` is a valid setext underline:
+/// all `=` chars → `Some(1)`, all `-` chars → `Some(2)`, otherwise `None`.
+fn setext_underline_level(line: &str) -> Option<u8> {
+    let t = line.trim();
+    if t.is_empty() { return None; }
+    if t.chars().all(|c| c == '=') { Some(1) }
+    else if t.chars().all(|c| c == '-') { Some(2) }
+    else { None }
+}
+
+/// Parse ATX and setext headings from raw Markdown, skipping code fences.
 fn extract_toc(markdown: &str) -> Vec<TocEntry> {
+    let lines: Vec<&str> = markdown.lines().collect();
     let mut entries = Vec::new();
     let mut in_code = false;
-    for line in markdown.lines() {
-        let t = line.trim_start();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let t = lines[i].trim_start();
+
         if t.starts_with("```") || t.starts_with("~~~") {
             in_code = !in_code;
+            i += 1;
             continue;
         }
-        if in_code {
-            continue;
-        }
+        if in_code { i += 1; continue; }
+
+        // ATX heading
         let level = t.chars().take_while(|&c| c == '#').count();
-        if level == 0 || level > 6 {
-            continue;
+        if level >= 1 && level <= 6 {
+            let rest = &t[level..];
+            if rest.starts_with(' ') {
+                let title = rest[1..].trim_end_matches(|c: char| c == '#' || c == ' ').to_owned();
+                entries.push(TocEntry { level: level as u8, title });
+                i += 1;
+                continue;
+            } else if rest.is_empty() {
+                entries.push(TocEntry { level: level as u8, title: String::new() });
+                i += 1;
+                continue;
+            }
         }
-        let rest = &t[level..];
-        if rest.starts_with(' ') {
-            let title = rest[1..].trim_end_matches(|c: char| c == '#' || c == ' ');
-            entries.push(TocEntry { level: level as u8, title: title.to_owned() });
-        } else if rest.is_empty() {
-            entries.push(TocEntry { level: level as u8, title: String::new() });
+
+        // Setext heading: non-blank text line followed by === (H1) or --- (H2)
+        if !t.is_empty() {
+            if let Some(level) = lines.get(i + 1).copied().and_then(setext_underline_level) {
+                entries.push(TocEntry { level, title: t.trim().to_owned() });
+                i += 2;
+                continue;
+            }
         }
+
+        i += 1;
     }
     entries
 }
 
-/// Split raw Markdown into segments at ATX heading boundaries, skipping code fences.
+/// Split raw Markdown into segments at heading boundaries (ATX and setext),
+/// skipping code fences.
 ///
 /// The returned `Vec` has the following layout:
 ///   - `segments[0]`: any content before the first heading (may be an empty string)
-///   - `segments[i + 1]`: TOC entry `i` (the heading line itself) plus all lines
-///     until the next heading
+///   - `segments[i + 1]`: TOC entry `i` (the heading line(s) themselves) plus all
+///     lines until the next heading
 ///
 /// This mapping lets the Decorated renderer scroll to TOC entry `i` by calling
 /// `scroll_to_cursor` right before it renders `segments[i + 1]`.
 fn split_markdown_at_headings(markdown: &str) -> Vec<String> {
+    let lines: Vec<&str> = markdown.lines().collect();
     let mut segments: Vec<String> = vec![String::new()];
     let mut in_code = false;
+    let mut i = 0;
 
-    for line in markdown.lines() {
+    while i < lines.len() {
+        let line = lines[i];
         let t = line.trim_start();
+
         if t.starts_with("```") || t.starts_with("~~~") {
             in_code = !in_code;
             // No `continue`: the fence line still belongs to the current segment.
         }
 
-        let is_heading = !in_code && {
+        let is_atx = !in_code && {
             let n = t.chars().take_while(|&c| c == '#').count();
             if n >= 1 && n <= 6 {
                 let rest = &t[n..];
@@ -975,13 +1009,32 @@ fn split_markdown_at_headings(markdown: &str) -> Vec<String> {
             }
         };
 
-        if is_heading {
+        // Setext: non-blank, non-fence line followed by === or ---
+        let setext_level = if !in_code && !t.is_empty()
+            && !(t.starts_with("```") || t.starts_with("~~~"))
+        {
+            lines.get(i + 1).copied().and_then(setext_underline_level)
+        } else {
+            None
+        };
+
+        if is_atx || setext_level.is_some() {
             segments.push(String::new());
         }
 
         let last = segments.last_mut().unwrap();
         last.push_str(line);
         last.push('\n');
+
+        if setext_level.is_some() {
+            // Consume the underline into the same segment.
+            last.push_str(lines[i + 1]);
+            last.push('\n');
+            i += 2;
+            continue;
+        }
+
+        i += 1;
     }
 
     segments
@@ -1104,35 +1157,61 @@ fn preprocess_qiita(markdown: &str) -> String {
 
 /// Pre-process Markdown for Decorated mode.
 ///
-/// Currently: inserts a horizontal rule (`---`) after every H1 heading so
-/// egui-commonmark renders a visible separator line below it.
+/// Inserts a horizontal rule (`---`) after every H1 heading (ATX and setext)
+/// so egui-commonmark renders a visible separator line below it.
 /// Code fences are left untouched.
 fn preprocess_decorated(markdown: &str) -> String {
+    let lines: Vec<&str> = markdown.lines().collect();
     let mut out = String::with_capacity(markdown.len() + 64);
     let mut in_code = false;
-    for line in markdown.lines() {
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
         let t = line.trim_start();
+
         if t.starts_with("```") || t.starts_with("~~~") {
             in_code = !in_code;
             out.push_str(line);
             out.push('\n');
+            i += 1;
             continue;
         }
         if in_code {
             out.push_str(line);
             out.push('\n');
+            i += 1;
             continue;
         }
+
         out.push_str(line);
         out.push('\n');
-        // H1 = exactly one '#' followed by a space or end-of-line.
+
+        // ATX H1: exactly one '#' followed by a space or end-of-line.
         let hashes = t.chars().take_while(|&c| c == '#').count();
         if hashes == 1 {
             let rest = &t[1..];
             if rest.is_empty() || rest.starts_with(' ') {
                 out.push_str("\n---\n");
+                i += 1;
+                continue;
             }
         }
+
+        // Setext heading: non-blank text line followed by === (H1) or --- (H2).
+        if !t.is_empty() {
+            if let Some(level) = lines.get(i + 1).copied().and_then(setext_underline_level) {
+                out.push_str(lines[i + 1]);
+                out.push('\n');
+                if level == 1 {
+                    out.push_str("\n---\n");
+                }
+                i += 2;
+                continue;
+            }
+        }
+
+        i += 1;
     }
     out
 }
