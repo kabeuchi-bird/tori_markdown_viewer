@@ -492,6 +492,22 @@ impl eframe::App for App {
             self.apply_font(ctx);
         }
 
+        // ---- Ctrl+scroll: font size ----
+        // Consume the vertical scroll so the content area doesn't also scroll.
+        let scroll_y = ctx.input_mut(|i| {
+            if i.modifiers.command {
+                let dy = i.smooth_scroll_delta.y;
+                i.smooth_scroll_delta.y = 0.0;
+                i.raw_scroll_delta.y   = 0.0;
+                dy
+            } else {
+                0.0
+            }
+        });
+        if scroll_y != 0.0 {
+            self.settings.font_size = (self.settings.font_size + scroll_y * 0.1).clamp(8.0, 72.0);
+        }
+
         // ---- Status bar ----
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.label(&self.status);
