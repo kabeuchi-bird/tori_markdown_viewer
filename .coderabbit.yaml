@@ -1,12 +1,9 @@
 language: "ja-JP"
 
-early_access: false
-
 reviews:
-  profile: "chill"
+  profile: "assertive"
   request_changes_workflow: false
   high_level_summary: true
-  high_level_summary_placeholder: "@coderabbitai summary"
   poem: false
   review_status: true
   collapse_walkthrough: false
@@ -15,7 +12,6 @@ reviews:
     drafts: false
     base_branches:
       - main
-      - master
 
   path_filters:
     - "!Cargo.lock"
@@ -30,26 +26,42 @@ reviews:
   path_instructions:
     - path: "src/app.rs"
       instructions: |
-        - egui/eframe 0.28 の即時モード GUI パターンに沿っているか確認してください。
-        - `ui.set_max_width(f32::INFINITY)` は段落区切りを破壊するため使用禁止です。
-          代わりに定数 `NO_WRAP_MAX_WIDTH`（100_000.0）を使用してください。
-        - `unsafe` ブロックがないことを確認してください。
-        - `clone()` の過剰使用がないか確認してください（egui の即時モードでは借用で十分なことが多い）。
-        - `ScrollArea` の使用箇所では、横スクロールが必要な場合は `both()` を、
-          縦のみで良い場合は `vertical()` を使っているか確認してください。
-        - `serde` のシリアライゼーション対象（`Settings` など）に追加フィールドを
-          加えるときは `#[serde(default)]` を付けてください（後方互換性のため）。
+        ## egui/eframe パターン
+        - `ui.set_max_width(f32::INFINITY)` は禁止。折り返しなし横スクロールには定数 `NO_WRAP_MAX_WIDTH`（100_000.0）を使うこと。
+        - `unsafe` ブロックを使わないこと。
+        - egui の即時モードでは借用で足りることが多い。不要な `clone()` を指摘すること。
+        - `ScrollArea` は横スクロールが必要なら `both()`、縦のみなら `vertical()` を使うこと。
+
+        ## フォント処理
+        - システムフォントのスキャンは起動時に1回だけ構築する `App::font_db` を経由すること。関数内で `fontdb::Database::new()` を呼ばないこと。
+        - `apply_font` は `last_applied_font` と比較して変化がなければ早期リターンするパターンを維持すること。
+
+        ## Decorated モード・TOC
+        - `DecoratedCache` は `App::markdown` が変わるたびに `None` にリセットすること。ファイル読み込み・自動リロードのどちらでもリセットが漏れていないか確認すること。
+        - 見出し検出には `atx_heading_level` / `setext_underline_level` ヘルパーを使うこと。`take_while(|&c| c == '#')` をインラインで書かないこと。
+        - `extract_toc` と `split_markdown_at_headings` は同じ文字列を同じ見出しとして認識しなければならない（`toc[i]` と `segments[i+1]` の対応を崩さないこと）。
+
+        ## 設定の永続化
+        - `Settings` に新しいフィールドを追加するときは必ず `#[serde(default)]` を付けること（旧バージョンの保存データとの後方互換性のため）。
+
+    - path: "src/settings.rs"
+      instructions: |
+        - `Settings` の全フィールドに `#[serde(default)]` が付いているか確認すること。
+        - enum に新しいバリアントを追加するときは `#[default]` の付いた既存バリアントを外さないこと（デシリアライズ失敗時のフォールバックとして機能する）。
+        - `f32` フィールド（`font_size` など）を追加する場合は、利用箇所で `clamp` による上下限チェックがあるか確認すること。
 
     - path: "Cargo.toml"
       instructions: |
-        - `eframe` / `egui` / `egui_commonmark` のバージョンを揃えてください。
-        - 不要な features を有効化していないか確認してください。
-        - `[patch.crates-io]` を追加する場合はコメントで理由を記載してください。
+        - `eframe` / `egui` / `egui_commonmark` のバージョンを揃えること。
+        - 不要な features を有効化していないか確認すること。
+        - 依存クレートを追加するときは `default-features = false` で必要最小限の機能のみ有効化することを検討すること。
+        - `[patch.crates-io]` を追加する場合はコメントで理由を記載すること。
 
     - path: ".github/workflows/**"
       instructions: |
-        - `ubuntu-latest` などランナーのバージョンが固定されているか確認してください。
-        - `cargo clippy` と `cargo fmt --check` が CI で実行されているか確認してください。
+        - ランナーは `ubuntu-latest` ではなくバージョン固定（例: `ubuntu-24.04`）を使うこと。
+        - `cargo clippy -- -D warnings` と `cargo fmt --check` が CI に含まれていない場合は追加を提案すること。
+        - `actions/checkout` などのアクションはメジャーバージョン固定（`@v4`）で使うこと。
 
 chat:
   auto_reply: true
