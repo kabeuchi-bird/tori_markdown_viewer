@@ -496,7 +496,7 @@ impl eframe::App for App {
         // input_mut consumes the scroll so the content area doesn't also scroll.
         let (scroll_y, keyboard_open) = ctx.input_mut(|i| {
             let scroll_y = if i.modifiers.command {
-                let dy = i.smooth_scroll_delta.y;
+                let dy = i.raw_scroll_delta.y;
                 i.smooth_scroll_delta.y = 0.0;
                 i.raw_scroll_delta.y = 0.0;
                 dy
